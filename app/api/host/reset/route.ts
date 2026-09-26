@@ -1,10 +1,10 @@
 import { resetParty } from "@/db/repository";
-import { assertHostRequest } from "@/lib/host-auth";
-import { apiError } from "@/lib/spotify";
+import { apiError, assertAdmin } from "@/lib/spotify";
 
 export async function POST(request: Request) {
   try {
-    await assertHostRequest(request);
+    const { adminCode } = await request.json() as { adminCode?: string };
+    assertAdmin(adminCode);
     await resetParty();
     return Response.json({ reset: true });
   } catch (error) {
