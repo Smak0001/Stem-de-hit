@@ -43,6 +43,10 @@ button, a, input { -webkit-tap-highlight-color: transparent; }
 .party-ticker-track { width: max-content; animation: party-ticker-scroll 34s linear infinite; will-change: transform; }
 
 @media (prefers-reduced-motion: reduce) {
-  .party-countdown-number, .party-track-transition { animation-duration: .01ms; }
-  .party-ticker-track { animation-duration: 70s; }
+  .party-mode-root *, .party-countdown-number, .party-track-transition, .party-ticker-track {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: .01ms !important;
+  }
 }

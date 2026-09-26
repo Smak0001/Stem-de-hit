@@ -1,11 +1,14 @@
 "use client";
+/* eslint-disable @next/next/no-img-element -- Spotify artwork and generated QR images are dynamic remote assets. */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { Check, ChevronUp, Copy, Headphones, Loader2, LockKeyhole, Maximize2, Music2, PartyPopper, Play, QrCode, RotateCcw, Search, Settings2, Smartphone, Sparkles, Users, Volume2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 type Track = { id: number; spotifyId: string; uri: string; name: string; artist: string; album: string; imageUrl: string | null; durationMs: number; votes: number; hasVoted: boolean; status: string };
 type SearchTrack = Omit<Track, "id" | "votes" | "hasVoted" | "status">;
@@ -46,6 +49,7 @@ function PartyReactionLayer() {
   const cursorRef = useRef(0);
 
   useEffect(() => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     const canvas = canvasRef.current;
     const context = canvas?.getContext("2d");
     if (!canvas || !context) return;
@@ -130,6 +134,7 @@ function PartyConfettiLayer({ burst }: { burst: number }) {
 
   useEffect(() => {
     if (burst === 0) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     const canvas = canvasRef.current;
     const context = canvas?.getContext("2d");
     if (!canvas || !context) return;
@@ -186,17 +191,19 @@ export default function PartyApp() {
   const [searching, setSearching] = useState(false);
   const [configured, setConfigured] = useState(false);
   const [notice, setNotice] = useState("");
-  const [hostMode, setHostMode] = useState(false);
+  const [noticeTone, setNoticeTone] = useState<"success" | "error">("success");
+  const [hostMode] = useState(() => typeof window !== "undefined" && new URLSearchParams(window.location.search).get("host") === "1");
+  const [hostAuthenticated, setHostAuthenticated] = useState(false);
   const [showHost, setShowHost] = useState(false);
   const [adminCode, setAdminCode] = useState("");
   const [clientId, setClientId] = useState("");
   const [devices, setDevices] = useState<Device[]>([]);
   const [selectedDevice, setSelectedDevice] = useState("");
   const [busyId, setBusyId] = useState<number | null>(null);
-  const [shareUrl, setShareUrl] = useState("");
+  const [shareUrl] = useState(() => typeof window === "undefined" ? "" : `${window.location.origin}/`);
   const [playback, setPlayback] = useState<Playback>({ active: false });
-  const [autoDj, setAutoDj] = useState(true);
-  const [partyMode, setPartyMode] = useState(false);
+  const [autoDj, setAutoDj] = useState(() => typeof window === "undefined" || localStorage.getItem("stem-de-hit-auto-dj") !== "false");
+  const [partyMode, setPartyMode] = useState(() => typeof window !== "undefined" && localStorage.getItem("stem-de-hit-party-mode") === "true");
   const [partyQrOpen, setPartyQrOpen] = useState(false);
   const [leaderCelebration, setLeaderCelebration] = useState(false);
   const [confettiBurst, setConfettiBurst] = useState(0);
@@ -218,35 +225,50 @@ export default function PartyApp() {
   const reactionFlushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reactionFlushBusy = useRef(false);
 
+  const showNotice = useCallback((message: string, tone: "success" | "error" = "success") => {
+    setNoticeTone(tone);
+    setNotice(message);
+  }, []);
+
   const refresh = useCallback(async () => {
     const data = await jsonFetch(`/api/state?voterId=${encodeURIComponent(getVoterId())}`);
     setTracks(data.tracks); setConfigured(data.configured); setVoterCount(Number(data.voterCount || 0));
   }, []);
 
   useEffect(() => {
-    setHostMode(new URLSearchParams(location.search).get("host") === "1");
-    setShareUrl(`${location.origin}/`);
-    setAdminCode(localStorage.getItem("stem-de-hit-admin") || "");
-    setAutoDj(localStorage.getItem("stem-de-hit-auto-dj") !== "false");
-    setPartyMode(localStorage.getItem("stem-de-hit-party-mode") === "true");
-    void refresh().catch((error) => setNotice(error.message));
-    const timer = setInterval(() => void refresh().catch(() => undefined), 1000);
-    return () => clearInterval(timer);
-  }, [refresh]);
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      if (!stopped && document.visibilityState === "visible") await refresh().catch((error) => showNotice(error instanceof Error ? error.message : "De lijst kon niet worden geladen.", "error"));
+      if (!stopped) timer = setTimeout(poll, document.visibilityState === "visible" ? (hostMode ? 1_000 : 2_500) : 10_000);
+    };
+    void poll();
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [hostMode, refresh, showNotice]);
 
   useEffect(() => {
-    const loadPlayback = () => void jsonFetch("/api/playback", { cache: "no-store" }).then(setPlayback).catch(() => setPlayback({ active: false }));
-    loadPlayback();
-    const timer = setInterval(loadPlayback, 1000);
-    return () => clearInterval(timer);
-  }, [configured]);
+    if (!hostMode) return;
+    void jsonFetch("/api/host/session", { cache: "no-store" }).then((data) => setHostAuthenticated(Boolean(data.authenticated))).catch(() => setHostAuthenticated(false));
+  }, [hostMode]);
+
+  useEffect(() => {
+    if (!configured) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      if (!stopped && document.visibilityState === "visible") await jsonFetch("/api/playback", { cache: "no-store" }).then(setPlayback).catch(() => undefined);
+      if (!stopped) timer = setTimeout(poll, document.visibilityState === "visible" ? (hostMode ? 1_000 : 8_000) : 15_000);
+    };
+    void poll();
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [configured, hostMode]);
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
     const code = params.get("code");
-    if (code && hostMode) void completeSpotifyLogin(code, params.get("state")).catch((error) => setNotice(error.message));
+    if (code && hostMode) void completeSpotifyLogin(code, params.get("state")).catch((error) => showNotice(error instanceof Error ? error.message : "Spotify koppelen lukte niet.", "error"));
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostMode]);
+  }, [hostMode, showNotice]);
 
   useEffect(() => {
     type ModelContext = { registerTool: (tool: unknown, options?: { signal: AbortSignal }) => void };
@@ -261,6 +283,10 @@ export default function PartyApp() {
 
   const candidateTracks = tracks.filter((track) => track.status === "candidate");
   const topTrack = candidateTracks[0];
+  const topTrackId = topTrack?.id ?? null;
+  const topTrackVotes = topTrack?.votes ?? 0;
+  const playbackItem = playback.item;
+  const playbackItemId = playbackItem?.spotifyId ?? null;
   const candidateSpotifyIds = new Set(candidateTracks.map((track) => track.spotifyId));
   const seenQueueIds = new Set<string>();
   const spotifyQueueTracks = (playback.queue || []).filter((track) => {
@@ -279,35 +305,35 @@ export default function PartyApp() {
   ];
 
   useEffect(() => {
-    if (!partyMode || !topTrack) { previousLeaderId.current = topTrack?.id || null; setLeaderCelebration(false); return; }
-    if (previousLeaderId.current !== null && previousLeaderId.current !== topTrack.id) {
-      setLeaderCelebration(true);
-      setConfettiBurst((current) => current + 1);
-      const timer = setTimeout(() => setLeaderCelebration(false), 4200);
-      previousLeaderId.current = topTrack.id;
-      return () => clearTimeout(timer);
+    if (!partyMode || topTrackId === null) { previousLeaderId.current = topTrackId; return; }
+    if (previousLeaderId.current !== null && previousLeaderId.current !== topTrackId) {
+      const showTimer = setTimeout(() => { setLeaderCelebration(true); setConfettiBurst((current) => current + 1); }, 0);
+      const hideTimer = setTimeout(() => setLeaderCelebration(false), 4200);
+      previousLeaderId.current = topTrackId;
+      return () => { clearTimeout(showTimer); clearTimeout(hideTimer); };
     }
-    previousLeaderId.current = topTrack.id;
-  }, [partyMode, topTrack?.id]);
+    previousLeaderId.current = topTrackId;
+  }, [partyMode, topTrackId]);
 
   useEffect(() => {
-    if (!partyMode || !topTrack) return;
-    const previousVotes = milestoneVotes.current.get(topTrack.id);
-    if (previousVotes !== undefined && topTrack.votes >= 10 && Math.floor(previousVotes / 10) < Math.floor(topTrack.votes / 10)) setConfettiBurst((current) => current + 1);
-    milestoneVotes.current.set(topTrack.id, topTrack.votes);
-  }, [partyMode, topTrack?.id, topTrack?.votes]);
+    if (!partyMode || topTrackId === null) return;
+    const previousVotes = milestoneVotes.current.get(topTrackId);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    if (previousVotes !== undefined && topTrackVotes >= 10 && Math.floor(previousVotes / 10) < Math.floor(topTrackVotes / 10)) timer = setTimeout(() => setConfettiBurst((current) => current + 1), 0);
+    milestoneVotes.current.set(topTrackId, topTrackVotes);
+    return () => { if (timer) clearTimeout(timer); };
+  }, [partyMode, topTrackId, topTrackVotes]);
 
   useEffect(() => {
-    const currentId = playback.item?.spotifyId || null;
-    if (!partyMode || !currentId) { previousPartyPlaybackId.current = currentId; setTransitionTrack(null); return; }
-    if (previousPartyPlaybackId.current && previousPartyPlaybackId.current !== currentId && playback.item) {
-      setTransitionTrack(playback.item);
-      const timer = setTimeout(() => setTransitionTrack(null), 2600);
-      previousPartyPlaybackId.current = currentId;
-      return () => clearTimeout(timer);
+    if (!partyMode || !playbackItemId) { previousPartyPlaybackId.current = playbackItemId; return; }
+    if (previousPartyPlaybackId.current && previousPartyPlaybackId.current !== playbackItemId && playbackItem) {
+      const showTimer = setTimeout(() => setTransitionTrack(playbackItem), 0);
+      const hideTimer = setTimeout(() => setTransitionTrack(null), 2600);
+      previousPartyPlaybackId.current = playbackItemId;
+      return () => { clearTimeout(showTimer); clearTimeout(hideTimer); };
     }
-    previousPartyPlaybackId.current = currentId;
-  }, [partyMode, playback.item?.spotifyId]);
+    previousPartyPlaybackId.current = playbackItemId;
+  }, [partyMode, playbackItemId, playbackItem]);
 
   useEffect(() => {
     if (!hostMode || !partyMode) return;
@@ -328,13 +354,13 @@ export default function PartyApp() {
   }, [hostMode, partyMode]);
 
   useEffect(() => {
-    if (!hostMode || !topTrack) { setShowQrCard(true); return; }
+    if (!hostMode || topTrackId === null) return;
     const timer = setInterval(() => setShowQrCard((current) => !current), 8000);
     return () => clearInterval(timer);
-  }, [hostMode, topTrack?.id]);
+  }, [hostMode, topTrackId]);
 
   useEffect(() => {
-    if (!hostMode || !autoDj || !adminCode) return;
+    if (!hostMode || !autoDj || !hostAuthenticated) return;
     if (!playback.active || !playback.item) {
       if (topTrack && lastPlaybackId.current && ++inactivePolls.current >= 2 && triggeredFor.current !== lastPlaybackId.current && !autoDjBusy.current) {
         triggeredFor.current = lastPlaybackId.current;
@@ -361,7 +387,7 @@ export default function PartyApp() {
       else expectedPlayback.current = null;
     }
     const isPlayedRequest = tracks.some((track) => track.status !== "candidate" && track.spotifyId === currentId);
-    if (isPlayedRequest && allowedRequestCurrent.current !== currentId && duplicateSkipInProgress.current !== currentId) {
+    if (isPlayedRequest && allowedRequestCurrent.current !== currentId && duplicateSkipInProgress.current !== currentId && !autoDjBusy.current) {
       duplicateSkipInProgress.current = currentId;
       lastPlaybackId.current = currentId;
       void skipDuplicate(playback.item.name);
@@ -379,32 +405,32 @@ export default function PartyApp() {
     }
   // Auto-DJ reacts to a real Spotify track transition or to playback ending without a next track.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playback, hostMode, autoDj, adminCode, topTrack?.id, tracks]);
+  }, [playback, hostMode, autoDj, hostAuthenticated, topTrack?.id, tracks]);
 
   useEffect(() => {
-    if (hostMode && configured && adminCode && devices.length === 0) void loadDevices(adminCode).catch(() => undefined);
+    if (hostMode && configured && hostAuthenticated && devices.length === 0) void loadDevices().catch(() => undefined);
   // Load the active Spotify device once when the host page is reopened.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostMode, configured, adminCode]);
+  }, [hostMode, configured, hostAuthenticated]);
   async function search(event: React.FormEvent) {
     event.preventDefault(); if (query.trim().length < 2) return;
     setSearching(true); setNotice("");
     try { const data = await jsonFetch(`/api/search?q=${encodeURIComponent(query.trim())}`); setResults(data.tracks); }
-    catch (error) { setNotice(error instanceof Error ? error.message : "Zoeken lukte niet."); }
+    catch (error) { showNotice(error instanceof Error ? error.message : "Zoeken lukte niet.", "error"); }
     finally { setSearching(false); }
   }
 
   async function add(track: SearchTrack) {
     setBusyId(-1); setNotice("");
-    try { await jsonFetch("/api/suggestions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ track, voterId: getVoterId() }) }); setResults([]); setQuery(""); setNotice(`${track.name} staat in de lijst.`); await refresh(); }
-    catch (error) { setNotice(error instanceof Error ? error.message : "Toevoegen lukte niet."); }
+    try { await jsonFetch("/api/suggestions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ track, voterId: getVoterId() }) }); setResults([]); setQuery(""); showNotice(`${track.name} staat in de lijst.`); await refresh(); }
+    catch (error) { showNotice(error instanceof Error ? error.message : "Toevoegen lukte niet.", "error"); }
     finally { setBusyId(null); }
   }
 
   async function vote(itemId: number) {
     setBusyId(itemId); setNotice("");
-    try { await jsonFetch("/api/vote", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ itemId, voterId: getVoterId() }) }); await refresh(); }
-    catch (error) { setNotice(error instanceof Error ? error.message : "Stemmen lukte niet."); }
+    try { await jsonFetch("/api/vote", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ itemId, voterId: getVoterId() }) }); showNotice("Je stem is geteld."); await refresh(); }
+    catch (error) { showNotice(error instanceof Error ? error.message : "Stemmen lukte niet.", "error"); }
     finally { setBusyId(null); }
   }
 
@@ -419,7 +445,7 @@ export default function PartyApp() {
     reactionFlushBusy.current = true;
     const emojis = pendingReactions.current.splice(0, 50);
     try { await jsonFetch("/api/reactions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ emojis, voterId: getVoterId() }) }); }
-    catch (error) { setNotice(error instanceof Error ? error.message : "Reacties versturen lukte niet."); }
+    catch (error) { showNotice(error instanceof Error ? error.message : "Reacties versturen lukte niet.", "error"); }
     finally {
       reactionFlushBusy.current = false;
       if (pendingReactions.current.length > 0 && !reactionFlushTimer.current) reactionFlushTimer.current = setTimeout(() => { reactionFlushTimer.current = null; void flushReactionQueue(); }, 50);
@@ -427,8 +453,13 @@ export default function PartyApp() {
   }
 
   async function beginSpotifyLogin() {
-    if (!clientId.trim() || !adminCode.trim()) { setNotice("Vul je Spotify Client ID en beheercode in."); return; }
-    localStorage.setItem("stem-de-hit-admin", adminCode.trim()); localStorage.setItem("stem-de-hit-client", clientId.trim());
+    if (!clientId.trim() || (!hostAuthenticated && !adminCode.trim())) { showNotice("Vul je Spotify Client ID en beheercode in.", "error"); return; }
+    if (!hostAuthenticated) {
+      await jsonFetch("/api/host/session", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode: adminCode.trim() }) });
+      setHostAuthenticated(true);
+      setAdminCode("");
+    }
+    localStorage.setItem("stem-de-hit-client", clientId.trim());
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
     const verifier = Array.from(crypto.getRandomValues(new Uint8Array(64)), (n) => chars[n % chars.length]).join("");
     localStorage.setItem("spotify-verifier", verifier);
@@ -441,52 +472,60 @@ export default function PartyApp() {
   }
 
   async function completeSpotifyLogin(code: string, returnedState: string | null) {
-    const verifier = localStorage.getItem("spotify-verifier"); const savedClient = localStorage.getItem("stem-de-hit-client"); const savedAdmin = localStorage.getItem("stem-de-hit-admin");
-    if (!verifier || !savedClient || !savedAdmin) throw new Error("De Spotify-aanmelding is verlopen. Start opnieuw.");
+    const verifier = localStorage.getItem("spotify-verifier"); const savedClient = localStorage.getItem("stem-de-hit-client");
+    if (!verifier || !savedClient) throw new Error("De Spotify-aanmelding is verlopen. Start opnieuw.");
     if (!returnedState || returnedState !== localStorage.getItem("spotify-state")) throw new Error("De Spotify-aanmelding kon niet veilig worden bevestigd. Start opnieuw.");
     const tokenResponse = await fetch("https://accounts.spotify.com/api/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: savedClient, grant_type: "authorization_code", code, redirect_uri: `${location.origin}/?host=1`, code_verifier: verifier }) });
     const tokens = await tokenResponse.json() as Record<string, string | number>; if (!tokenResponse.ok) throw new Error("Spotify kon niet worden gekoppeld. Controleer de Redirect URI.");
-    await jsonFetch("/api/host/setup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode: savedAdmin, clientId: savedClient, ...tokens }) });
+    await jsonFetch("/api/host/setup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ clientId: savedClient, ...tokens }) });
     localStorage.removeItem("spotify-verifier"); localStorage.removeItem("spotify-state");
-    history.replaceState({}, "", "/?host=1"); setNotice("Spotify is gekoppeld."); setConfigured(true); setAdminCode(savedAdmin); await loadDevices(savedAdmin);
+    history.replaceState({}, "", "/?host=1"); showNotice("Spotify is gekoppeld."); setConfigured(true); setHostAuthenticated(true); await loadDevices();
   }
 
-  async function loadDevices(code = adminCode) {
-    localStorage.setItem("stem-de-hit-admin", code);
-    const data = await jsonFetch(`/api/host/devices?adminCode=${encodeURIComponent(code)}`);
+  async function unlockHost() {
+    if (!adminCode.trim()) { showNotice("Vul de beheercode in.", "error"); return; }
+    try {
+      await jsonFetch("/api/host/session", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode: adminCode.trim() }) });
+      setHostAuthenticated(true); setAdminCode(""); showNotice("Hostinstellingen ontgrendeld.");
+      if (configured) await loadDevices();
+    } catch (error) { showNotice(error instanceof Error ? error.message : "Ontgrendelen lukte niet.", "error"); }
+  }
+
+  async function loadDevices() {
+    const data = await jsonFetch("/api/host/devices", { method: "POST" });
     setDevices(data.devices); setSelectedDevice(data.devices.find((device: Device) => device.is_active)?.id || data.devices[0]?.id || ""); setNotice("");
   }
 
   async function playNext(itemId?: number, automatic = false, immediate = true) {
     setBusyId(itemId ?? -2);
-    if (automatic) autoDjBusy.current = true;
+    autoDjBusy.current = true;
     try {
-      const data = await jsonFetch("/api/host/play-next", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode, itemId, deviceId: selectedDevice || undefined, immediate }) });
+      const data = await jsonFetch("/api/host/play-next", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ itemId, deviceId: selectedDevice || undefined, immediate }) });
       expectedPlayback.current = { spotifyId: data.spotifyId, until: Date.now() + (immediate ? 10_000 : 90_000) };
-      setNotice(automatic && !immediate ? `${data.name} staat klaar als volgende.` : automatic ? `${data.name} is als winnaar gestart.` : `${data.name} speelt nu op Spotify.`);
+      showNotice(automatic && !immediate ? `${data.name} staat klaar als volgende.` : automatic ? `${data.name} is als winnaar gestart.` : `${data.name} speelt nu op Spotify.`);
       await refresh();
       const latest = await jsonFetch("/api/playback", { cache: "no-store" }).catch(() => null);
       if (latest?.item?.spotifyId) lastPlaybackId.current = latest.item.spotifyId;
       if (latest) setPlayback(latest);
     }
-    catch (error) { if (automatic) triggeredFor.current = ""; setNotice(error instanceof Error ? error.message : "Afspelen op Spotify lukte niet."); }
+    catch (error) { if (automatic) triggeredFor.current = ""; showNotice(error instanceof Error ? error.message : "Afspelen op Spotify lukte niet.", "error"); }
     finally { setBusyId(null); autoDjBusy.current = false; }
   }
 
   async function skipDuplicate(name: string) {
     try {
-      await jsonFetch("/api/host/skip", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode, deviceId: selectedDevice || undefined }) });
-      setNotice(`${name} was al gekozen en is automatisch overgeslagen.`);
+      await jsonFetch("/api/host/skip", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: selectedDevice || undefined }) });
+      showNotice(`${name} was al gekozen en is automatisch overgeslagen.`);
     } catch (error) {
       duplicateSkipInProgress.current = null;
-      setNotice(error instanceof Error ? error.message : "Dubbel nummer overslaan lukte niet.");
+      showNotice(error instanceof Error ? error.message : "Dubbel nummer overslaan lukte niet.", "error");
     }
   }
 
   async function startNewParty() {
     setBusyId(-3); setNotice("");
-    try { await jsonFetch("/api/host/reset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode }) }); setTracks([]); setResults([]); setQuery(""); triggeredFor.current = ""; setNotice("Nieuwe sessie gestart. De oude verzoeken en stemmen zijn gewist."); await refresh(); }
-    catch (error) { setNotice(error instanceof Error ? error.message : "Nieuwe sessie starten lukte niet."); }
+    try { await jsonFetch("/api/host/reset", { method: "POST" }); setTracks([]); setResults([]); setQuery(""); triggeredFor.current = ""; showNotice("Nieuwe sessie gestart. De oude verzoeken en stemmen zijn gewist."); await refresh(); }
+    catch (error) { showNotice(error instanceof Error ? error.message : "Nieuwe sessie starten lukte niet.", "error"); }
     finally { setBusyId(null); }
   }
 
@@ -496,8 +535,8 @@ export default function PartyApp() {
   return (
     <main className={`${hostMode ? "h-[100dvh] overflow-hidden" : "min-h-screen"} bg-[radial-gradient(circle_at_75%_5%,rgba(81,255,168,.13),transparent_28%),linear-gradient(145deg,#07110d_0%,#0d1813_52%,#050907_100%)] text-white`}>
       <header className={`mx-auto flex max-w-7xl items-center justify-between px-4 sm:px-8 ${hostMode ? "h-16" : "py-4 sm:py-5"}`}>
-        <a href="/" className="flex items-center gap-3 font-black tracking-tight"><span className="grid h-10 w-10 place-items-center rounded-2xl bg-[#64f5a4] text-[#07110d] shadow-[0_0_28px_rgba(100,245,164,.28)]"><Music2 size={21}/></span><span className="text-xl">Stem de Hit</span></a>
-        <div className="flex items-center gap-2">{hostMode && <span className={`hidden rounded-full px-3 py-1 text-xs font-black sm:block ${autoDj ? "bg-[#64f5a4]/15 text-[#64f5a4]" : "bg-white/10 text-zinc-500"}`}>Auto-DJ {autoDj ? "aan" : "uit"}</span>}<Button variant="ghost" className="rounded-full text-zinc-300 hover:bg-white/10 hover:text-white" onClick={() => setShowHost(!showHost)}><Settings2 size={17}/><span className="hidden sm:inline">Hostinstellingen</span></Button></div>
+        <Link href="/" className="flex items-center gap-3 font-black tracking-tight"><span className="grid h-10 w-10 place-items-center rounded-2xl bg-[#64f5a4] text-[#07110d] shadow-[0_0_28px_rgba(100,245,164,.28)]"><Music2 size={21}/></span><span className="text-xl">Stem de Hit</span></Link>
+        {hostMode && <div className="flex items-center gap-2"><span className={`hidden rounded-full px-3 py-1 text-xs font-black sm:block ${autoDj ? "bg-[#64f5a4]/15 text-[#64f5a4]" : "bg-white/10 text-zinc-400"}`}>Auto-DJ {autoDj ? "aan" : "uit"}</span><Button variant="ghost" className="rounded-full text-zinc-300 hover:bg-white/10 hover:text-white" onClick={() => setShowHost(true)}><Settings2 size={17}/><span className="hidden sm:inline">Hostinstellingen</span></Button></div>}
       </header>
 
       <section className={`mx-auto grid max-w-7xl gap-4 px-4 sm:px-8 ${hostMode ? "h-[calc(100dvh-4rem)] min-h-0 pb-4 lg:grid-cols-[minmax(0,1fr)_minmax(300px,360px)]" : "gap-6 pb-10 pt-1 sm:pb-16 sm:pt-3 lg:grid-cols-[minmax(0,1fr)_360px] lg:pt-8"}`}>
@@ -506,11 +545,12 @@ export default function PartyApp() {
           {!hostMode && playback.active && playback.item && <div className="mb-4 flex items-center gap-3 rounded-2xl border border-[#64f5a4]/20 bg-[#0d1d15] p-3 shadow-xl lg:hidden">{playback.item.imageUrl ? <img src={playback.item.imageUrl} alt="Albumhoes" className="h-14 w-14 shrink-0 rounded-xl object-cover"/> : <span className="grid h-14 w-14 shrink-0 place-items-center rounded-xl bg-white/10"><Music2/></span>}<div className="min-w-0 flex-1"><div className="mb-1 flex items-center justify-between gap-2"><span className="flex items-center gap-1.5 text-[11px] font-black uppercase tracking-wider text-[#64f5a4]"><Volume2 size={12}/>Nu speelt</span><span className="text-[11px] text-zinc-600">{formatDuration(playback.progressMs || 0)} / {formatDuration(playback.item.durationMs)}</span></div><h2 className="truncate font-black">{playback.item.name}</h2><p className="truncate text-sm text-zinc-500">{playback.item.artist}</p><div className="mt-2 h-1 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-[#64f5a4] transition-all" style={{ width: `${Math.min(100, Math.max(0, ((playback.progressMs || 0) / Math.max(1, playback.item.durationMs)) * 100))}%` }}/></div></div></div>}
           {hostMode && <div className="relative mb-3 overflow-hidden rounded-2xl border border-[#64f5a4]/20 bg-[linear-gradient(110deg,rgba(100,245,164,.12),rgba(255,255,255,.025))] px-5 py-3"><div className="absolute -right-8 -top-16 h-40 w-40 rounded-full bg-[#64f5a4]/10 blur-3xl"/><div className="relative flex items-end justify-between gap-5"><div><p className="mb-1 flex items-center gap-2 text-xs font-black uppercase tracking-[.18em] text-[#64f5a4]"><PartyPopper size={14}/>Jij bepaalt wat hierna komt</p><h1 className="text-2xl font-black leading-none tracking-[-.04em] sm:text-3xl">Zoek. Stem. <span className="text-zinc-500">Zet de avond aan.</span></h1></div><div className="hidden shrink-0 items-end gap-1.5 sm:flex" aria-hidden="true"><span className="h-3 w-1.5 animate-pulse rounded-full bg-[#64f5a4]/35"/><span className="h-7 w-1.5 animate-pulse rounded-full bg-[#64f5a4]/55 [animation-delay:150ms]"/><span className="h-5 w-1.5 animate-pulse rounded-full bg-[#64f5a4]/75 [animation-delay:300ms]"/><span className="h-9 w-1.5 animate-pulse rounded-full bg-[#64f5a4] [animation-delay:450ms]"/><span className="h-4 w-1.5 animate-pulse rounded-full bg-[#64f5a4]/60 [animation-delay:600ms]"/></div></div></div>}
           {!hostMode && <div className="mb-4 flex items-center justify-between gap-3 rounded-2xl border border-fuchsia-400/15 bg-fuchsia-400/[.06] p-2.5 sm:p-3"><div className="pl-1"><p className="text-sm font-black text-fuchsia-100">Reageer live</p><p className="hidden text-xs text-zinc-500 sm:block">Verschijnt in Party Mode</p></div><div className="flex gap-1.5">{["🔥", "❤️", "🎉", "🙌"].map((emoji) => <button key={emoji} onClick={() => sendReaction(emoji)} aria-label={`Stuur ${emoji}`} className="grid h-11 w-11 touch-manipulation place-items-center rounded-xl border border-white/10 bg-white/[.06] text-xl transition hover:-translate-y-1 hover:border-fuchsia-300/40 hover:bg-fuchsia-300/10 active:scale-90 sm:h-12 sm:w-12 sm:text-2xl">{emoji}</button>)}</div></div>}
+          {!hostMode && !configured && <div role="status" className="mb-4 rounded-2xl border border-amber-300/20 bg-amber-300/[.08] px-4 py-3 text-sm text-amber-100">De host verbindt Spotify. Zoeken wordt automatisch beschikbaar.</div>}
           <div className="relative z-30">
-            <form onSubmit={search} className="relative mb-2"><Search className="absolute left-5 top-1/2 -translate-y-1/2 text-zinc-500" size={hostMode ? 19 : 22}/><Input value={query} onChange={(e) => setQuery(e.target.value)} placeholder={configured ? "Zoek een nummer of artiest" : "Spotify wordt zo gekoppeld door de host"} disabled={!configured} className={`${hostMode ? "h-12" : "h-16"} rounded-2xl border-white/10 bg-white/[.07] pl-14 pr-28 text-base text-white placeholder:text-zinc-500 focus-visible:border-[#64f5a4]/70 focus-visible:ring-[#64f5a4]/20`}/><Button type="submit" disabled={searching || !configured} className={`absolute right-2 rounded-xl bg-[#64f5a4] px-5 font-bold text-[#06100b] hover:bg-[#8affba] ${hostMode ? "top-1.5 h-9" : "top-2 h-12"}`}>{searching ? <Loader2 className="animate-spin"/> : "Zoeken"}</Button></form>
-            {results.length > 0 && <div className={`${hostMode ? "absolute left-0 right-0 top-14 max-h-[55vh] overflow-y-auto" : "mb-8"} overflow-hidden rounded-2xl border border-white/10 bg-[#111d17] shadow-2xl`}><div className="flex items-center justify-between border-b border-white/10 px-5 py-3 text-sm text-zinc-400"><span>Spotify-resultaten</span><button onClick={() => setResults([])} aria-label="Sluiten"><X size={18}/></button></div>{results.map((track) => <button key={track.spotifyId} onClick={() => add(track)} disabled={busyId === -1} className="flex w-full items-center gap-3 border-b border-white/[.06] p-3 text-left last:border-0 hover:bg-white/[.06]">{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-12 w-12 rounded-lg object-cover"/> : <span className="grid h-12 w-12 place-items-center rounded-lg bg-white/10"><Music2/></span>}<span className="min-w-0 flex-1"><strong className="block truncate text-[15px]">{track.name}</strong><span className="block truncate text-sm text-zinc-400">{track.artist}</span></span><span className="text-xs text-zinc-500">{formatDuration(track.durationMs)}</span><span className="grid h-9 w-9 place-items-center rounded-full bg-[#64f5a4] text-xl font-bold text-[#07110d]">+</span></button>)}</div>}
+            <form onSubmit={search} className="relative mb-2"><Search className="absolute left-5 top-1/2 -translate-y-1/2 text-zinc-400" size={hostMode ? 19 : 22}/><Input aria-label="Zoek een nummer of artiest op Spotify" value={query} onChange={(e) => setQuery(e.target.value)} placeholder={configured ? "Zoek nummer of artiest" : "Wachten op Spotify…"} disabled={!configured} className={`${hostMode ? "h-12" : "h-16"} rounded-2xl border-white/10 bg-white/[.07] pl-14 pr-28 text-base text-white placeholder:text-zinc-400 focus-visible:border-[#64f5a4]/70 focus-visible:ring-[#64f5a4]/20 disabled:cursor-wait disabled:opacity-70`}/><Button type="submit" disabled={searching || !configured} className={`absolute right-2 rounded-xl bg-[#64f5a4] px-5 font-bold text-[#06100b] hover:bg-[#8affba] ${hostMode ? "top-1.5 h-9" : "top-2 h-12"}`}>{searching ? <><Loader2 className="animate-spin"/><span className="sr-only">Zoeken</span></> : "Zoeken"}</Button></form>
+            {results.length > 0 && <div role="listbox" aria-label="Spotify-resultaten" className={`${hostMode ? "absolute left-0 right-0 top-14 max-h-[55vh] overflow-y-auto" : "mb-8"} overflow-hidden rounded-2xl border border-white/10 bg-[#111d17] shadow-2xl`}><div className="flex items-center justify-between border-b border-white/10 px-5 py-3 text-sm text-zinc-300"><span>Spotify-resultaten</span><button onClick={() => setResults([])} aria-label="Resultaten sluiten" className="grid h-10 w-10 place-items-center rounded-full hover:bg-white/10"><X size={18}/></button></div>{results.map((track) => <button role="option" aria-selected="false" key={track.spotifyId} onClick={() => add(track)} disabled={busyId === -1} className="flex w-full items-center gap-3 border-b border-white/[.06] p-3 text-left last:border-0 hover:bg-white/[.06]">{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-12 w-12 rounded-lg object-cover"/> : <span className="grid h-12 w-12 place-items-center rounded-lg bg-white/10"><Music2/></span>}<span className="min-w-0 flex-1"><strong className="block truncate text-[15px]">{track.name}</strong><span className="block truncate text-sm text-zinc-300">{track.artist}</span></span><span className="text-xs text-zinc-400">{formatDuration(track.durationMs)}</span><span className="grid h-9 w-9 place-items-center rounded-full bg-[#64f5a4] text-xl font-bold text-[#07110d]">+</span></button>)}</div>}
           </div>
-          {notice && <div className={`${hostMode ? "mb-2 py-2" : "my-4 py-3"} flex items-center gap-2 rounded-xl border border-[#64f5a4]/20 bg-[#64f5a4]/10 px-4 text-sm text-[#b9ffd5]`}><Sparkles size={16}/><span className="truncate">{notice}</span></div>}
+          {notice && <div role={noticeTone === "error" ? "alert" : "status"} aria-live={noticeTone === "error" ? "assertive" : "polite"} className={`${hostMode ? "mb-2 py-2" : "my-4 py-3"} flex items-start gap-2 rounded-xl border px-4 text-sm ${noticeTone === "error" ? "border-red-300/25 bg-red-300/10 text-red-100" : "border-[#64f5a4]/20 bg-[#64f5a4]/10 text-[#b9ffd5]"}`}><Sparkles size={16} className="mt-0.5 shrink-0"/><span>{notice}</span></div>}
           <div className={`${hostMode ? "mt-1 pb-2" : "mt-6 pb-3 sm:mt-8 sm:pb-4"} flex items-end justify-between border-b border-white/10`}><div><p className="text-sm text-zinc-500">De gezamenlijke volgorde</p><h2 className={`${hostMode ? "text-xl" : "text-2xl"} font-bold tracking-tight`}>Hierna</h2></div><span className="flex items-center gap-2 text-sm text-zinc-400"><Users size={16}/>{candidateTracks.length} {candidateTracks.length === 1 ? "verzoek" : "verzoeken"}</span></div>
           <div className="min-h-0 divide-y divide-white/[.07] overflow-hidden">
             {shownTracks.map((track, index) => <article key={track.id} className={`group flex items-center gap-3 ${hostMode ? "py-2" : "py-4"}`}><span className={`w-6 text-center text-sm font-black ${index === 0 ? "text-[#64f5a4]" : "text-zinc-600"}`}>{index + 1}</span>{track.imageUrl ? <img src={track.imageUrl} alt="" className={`${hostMode ? "h-11 w-11" : "h-14 w-14"} rounded-xl object-cover shadow-lg`}/> : <span className={`${hostMode ? "h-11 w-11" : "h-14 w-14"} grid place-items-center rounded-xl bg-white/10`}><Music2/></span>}<div className="min-w-0 flex-1"><h3 className="truncate font-bold">{track.name}</h3><p className="truncate text-sm text-zinc-500">{track.artist} · {formatDuration(track.durationMs)}</p></div>{hostMode ? <div className="flex items-center gap-2"><span className="flex min-w-20 items-center justify-center gap-1 rounded-xl border border-[#64f5a4]/25 bg-[#64f5a4]/10 px-3 py-2 text-sm font-black text-[#64f5a4]"><Users size={15}/>{track.votes}</span><Button size="sm" onClick={() => playNext(track.id)} disabled={busyId === track.id} className="rounded-xl bg-white/10 text-white hover:bg-[#64f5a4] hover:text-[#07110d]"><Play size={16}/><span className="hidden xl:inline">Speel nu</span></Button></div> : <button onClick={() => vote(track.id)} disabled={busyId === track.id || track.hasVoted} aria-label={`Stem op ${track.name}`} className={`flex min-w-16 items-center justify-center gap-1 rounded-xl border px-3 py-2 font-black transition ${track.hasVoted ? "border-[#64f5a4]/30 bg-[#64f5a4]/15 text-[#64f5a4]" : "border-white/10 bg-white/[.05] hover:-translate-y-0.5 hover:border-[#64f5a4]/50 hover:bg-[#64f5a4]/10"}`}>{track.hasVoted ? <Check size={17}/> : <ChevronUp size={18}/>} {track.votes}</button>}</article>)}
@@ -531,7 +571,7 @@ export default function PartyApp() {
         </aside>
       </section>
 
-      {hostMode && partyMode && <section className="fixed inset-0 z-40 overflow-hidden text-white transition-[background] duration-[2000ms]" style={{ background: partyTheme.background }}>
+      {hostMode && partyMode && <section className="party-mode-root fixed inset-0 z-40 overflow-hidden text-white transition-[background] duration-[2000ms]" style={{ background: partyTheme.background }}>
         <div className="pointer-events-none absolute -left-[12vw] -top-[24vh] h-[70vh] w-[70vh] animate-pulse rounded-full opacity-20 blur-[120px] transition-colors duration-[2000ms]" style={{ backgroundColor: partyTheme.secondary }}/>
         <div className="pointer-events-none absolute -bottom-[30vh] right-[2vw] h-[75vh] w-[75vh] animate-pulse rounded-full opacity-15 blur-[130px] transition-colors duration-[2000ms] [animation-delay:900ms]" style={{ backgroundColor: partyTheme.primary }}/>
         <div className="pointer-events-none absolute inset-0 overflow-hidden" aria-hidden="true">{["♪","♫","♪","♬","♫","♪"].map((note, index) => <span key={index} className="absolute animate-bounce font-black text-white/[.06]" style={{ left: `${8 + index * 17}%`, top: `${16 + (index % 3) * 25}%`, fontSize: `${28 + (index % 3) * 16}px`, animationDuration: `${3.8 + index * .55}s`, animationDelay: `${index * .45}s` }}>{note}</span>)}</div>
@@ -552,31 +592,29 @@ export default function PartyApp() {
               <button onClick={() => setPartyQrOpen(true)} className="flex shrink-0 items-center gap-4 rounded-[24px] border border-[#64f5a4]/20 bg-[#64f5a4]/10 p-4 text-left transition hover:bg-[#64f5a4]/15"><div className="grid h-20 w-20 shrink-0 place-items-center overflow-hidden rounded-xl bg-white p-1.5">{shareUrl ? <img src={`https://quickchart.io/qr?text=${encodeURIComponent(shareUrl)}&size=160&margin=1`} alt="QR-code" className="h-full w-full"/> : <QrCode className="text-[#07110d]"/>}</div><div className="min-w-0 flex-1"><p className="font-black text-[#baffd4]">Nog iemand laten stemmen?</p><p className="mt-1 text-sm text-[#79ba96]">Klik om de QR-code groot te tonen</p></div><QrCode className="shrink-0 text-[#64f5a4]"/></button></aside>
           </div>
         </div>
-        <div className="absolute inset-x-0 bottom-0 z-[35] h-12 overflow-hidden border-t border-white/10 bg-black/65 backdrop-blur-xl"><div className="party-ticker-track flex h-full items-center">{[...tickerItems, ...tickerItems].map((item, index) => <span key={`${item}-${index}`} className="flex shrink-0 items-center gap-6 px-7 text-sm font-black tracking-wide text-white/90"><span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: partyTheme.primary }}/>{item}</span>)}</div></div>
+        <div aria-hidden="true" className="absolute inset-x-0 bottom-0 z-[35] h-12 overflow-hidden border-t border-white/10 bg-black/65 backdrop-blur-xl"><div className="party-ticker-track flex h-full items-center">{[...tickerItems, ...tickerItems].map((item, index) => <span key={`${item}-${index}`} className="flex shrink-0 items-center gap-6 px-7 text-sm font-black tracking-wide text-white/90"><span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: partyTheme.primary }}/>{item}</span>)}</div></div>
       </section>}
 
-      {hostMode && partyMode && partyQrOpen && <div className="fixed inset-0 z-[45] grid place-items-center bg-black/85 p-6 backdrop-blur-xl" onClick={() => setPartyQrOpen(false)}><div className="w-full max-w-md rounded-[32px] border border-white/10 bg-[#101914] p-7 text-center shadow-2xl" onClick={(event) => event.stopPropagation()}><div className="mb-5 flex items-center justify-between"><div className="text-left"><p className="text-xs font-black uppercase tracking-[.18em] text-[#64f5a4]">Scan & stem</p><h2 className="mt-1 text-2xl font-black">Doe mee met de muziek</h2></div><button onClick={() => setPartyQrOpen(false)} aria-label="Sluiten" className="grid h-10 w-10 place-items-center rounded-full bg-white/10"><X/></button></div><div className="mx-auto aspect-square w-full rounded-[24px] bg-white p-5">{shareUrl ? <img src={`https://quickchart.io/qr?text=${encodeURIComponent(shareUrl)}&size=520&margin=1`} alt="QR-code naar de verzoeklijst" className="h-full w-full"/> : <Loader2 className="m-auto animate-spin text-[#07110d]"/>}</div><p className="mt-5 text-lg font-black text-[#64f5a4]">{voterCount} {voterCount === 1 ? "stemmer doet" : "stemmers doen"} al mee</p></div></div>}
+      <Dialog open={hostMode && partyMode && partyQrOpen} onOpenChange={setPartyQrOpen}><DialogContent className="z-[60] w-full max-w-md rounded-[32px] border-white/10 bg-[#101914] p-7 text-center text-white shadow-2xl"><DialogHeader className="mb-2 text-left"><p className="text-xs font-black uppercase tracking-[.18em] text-[#64f5a4]">Scan & stem</p><DialogTitle className="text-2xl font-black">Doe mee met de muziek</DialogTitle><DialogDescription className="sr-only">Scan deze QR-code om de stemlijst op je telefoon te openen.</DialogDescription></DialogHeader><div className="mx-auto aspect-square w-full rounded-[24px] bg-white p-5">{shareUrl ? <img src={`https://quickchart.io/qr?text=${encodeURIComponent(shareUrl)}&size=520&margin=1`} alt="QR-code naar de verzoeklijst" className="h-full w-full"/> : <Loader2 className="m-auto animate-spin text-[#07110d]"/>}</div><p className="mt-1 text-lg font-black text-[#64f5a4]">{voterCount} {voterCount === 1 ? "stemmer doet" : "stemmers doen"} al mee</p></DialogContent></Dialog>
 
-      {showHost && <div className="fixed inset-0 z-50 grid place-items-end bg-black/70 p-0 backdrop-blur-sm sm:place-items-center sm:p-5" onMouseDown={(e) => { if (e.target === e.currentTarget) setShowHost(false); }}>
-        <section className="max-h-[92vh] w-full max-w-xl overflow-y-auto rounded-t-[28px] border border-white/10 bg-[#101914] p-6 shadow-2xl sm:rounded-[28px] sm:p-8">
-          <div className="mb-6 flex items-start justify-between"><div><p className="mb-2 flex items-center gap-2 text-sm font-bold text-[#64f5a4]"><LockKeyhole size={16}/>Alleen voor de host</p><h2 className="text-3xl font-black tracking-tight">Bedien de avond</h2></div><button onClick={() => setShowHost(false)} aria-label="Sluiten"><X/></button></div>
+      <Dialog open={showHost} onOpenChange={setShowHost}><DialogContent className="max-h-[92vh] max-w-xl overflow-y-auto rounded-[28px] border-white/10 bg-[#101914] p-6 text-white shadow-2xl sm:p-8">
+          <DialogHeader className="mb-2 text-left"><p className="flex items-center gap-2 text-sm font-bold text-[#64f5a4]"><LockKeyhole size={16}/>Alleen voor de host</p><DialogTitle className="text-3xl font-black tracking-tight">Bedien de avond</DialogTitle><DialogDescription className="text-zinc-400">Beheer Spotify, Auto-DJ en de huidige muzieksessie.</DialogDescription></DialogHeader>
           <div className="mb-5 flex items-center justify-between gap-4 rounded-2xl border border-white/10 bg-white/[.04] p-4"><div><label htmlFor="auto-dj" className="font-bold">Auto-DJ</label><p className="mt-1 text-sm text-zinc-500">Speel automatisch het nummer met de meeste stemmen.</p></div><Switch id="auto-dj" checked={autoDj} onCheckedChange={(next) => { setAutoDj(next); localStorage.setItem("stem-de-hit-auto-dj", String(next)); }}/></div>
           {hostMode && <div className="mb-5 flex items-center justify-between gap-4 rounded-2xl border border-fuchsia-400/20 bg-fuchsia-400/[.07] p-4"><div><label htmlFor="party-mode" className="font-bold text-fuchsia-100">Party Mode</label><p className="mt-1 text-sm text-zinc-500">Grote albumhoes, top drie, animaties en compacte QR-code.</p></div><Switch id="party-mode" checked={partyMode} onCheckedChange={(next) => { setPartyMode(next); setPartyQrOpen(false); localStorage.setItem("stem-de-hit-party-mode", String(next)); }}/></div>}
           {!configured ? <div className="space-y-4">
             <p className="text-sm leading-6 text-zinc-400">Maak in het Spotify Developer Dashboard een app aan en voeg deze exacte Redirect URI toe:</p>
             <code className="block overflow-x-auto rounded-xl bg-black/30 p-3 text-xs text-[#9cfbc4]">{shareUrl}?host=1</code>
             <label className="block text-sm font-semibold">Spotify Client ID<Input value={clientId} onChange={(e) => setClientId(e.target.value)} className="mt-2 h-12 border-white/10 bg-white/[.06]" placeholder="Bijvoorbeeld 1a2b3c…"/></label>
-            <label className="block text-sm font-semibold">Beheercode<Input type="password" value={adminCode} onChange={(e) => setAdminCode(e.target.value)} className="mt-2 h-12 border-white/10 bg-white/[.06]" placeholder="De code die je van ons krijgt"/></label>
-            <Button onClick={beginSpotifyLogin} className="h-12 w-full rounded-xl bg-[#64f5a4] font-black text-[#07110d] hover:bg-[#8affba]">Koppel met Spotify</Button>
-          </div> : <div className="space-y-5">
+            {!hostAuthenticated && <label className="block text-sm font-semibold">Beheercode<Input type="password" autoComplete="current-password" value={adminCode} onChange={(e) => setAdminCode(e.target.value)} className="mt-2 h-12 border-white/10 bg-white/[.06]" placeholder="De code die je van ons krijgt"/></label>}
+            <Button onClick={() => void beginSpotifyLogin().catch((error) => showNotice(error instanceof Error ? error.message : "Spotify koppelen lukte niet.", "error"))} className="h-12 w-full rounded-xl bg-[#64f5a4] font-black text-[#07110d] hover:bg-[#8affba]">Koppel met Spotify</Button>
+          </div> : !hostAuthenticated ? <div className="space-y-4 rounded-2xl border border-white/10 bg-white/[.04] p-4"><p className="text-sm text-zinc-300">Ontgrendel de hostbediening om apparaten te kiezen of de sessie opnieuw te starten.</p><label className="block text-sm font-semibold">Beheercode<Input type="password" autoComplete="current-password" value={adminCode} onChange={(e) => setAdminCode(e.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void unlockHost(); }} className="mt-2 h-12 border-white/10 bg-white/[.06]" autoFocus/></label><Button onClick={() => void unlockHost()} className="h-12 w-full rounded-xl bg-[#64f5a4] font-black text-[#07110d] hover:bg-[#8affba]">Ontgrendel host</Button></div> : <div className="space-y-5">
             <div className="rounded-2xl border border-[#64f5a4]/20 bg-[#64f5a4]/10 p-4 text-sm text-[#bcffd7]"><strong className="flex items-center gap-2"><Check size={17}/>Spotify is gekoppeld</strong><p className="mt-1 text-[#8bd7aa]">Laat Spotify spelen op de laptop en kies dat apparaat hieronder.</p></div>
-            <label className="block text-sm font-semibold">Beheercode<div className="mt-2 flex gap-2"><Input type="password" value={adminCode} onChange={(e) => setAdminCode(e.target.value)} className="h-11 border-white/10 bg-white/[.06]"/><Button onClick={() => loadDevices()} variant="outline" className="h-11 border-white/10 bg-white/[.06] text-white hover:bg-white/10">Ververs</Button></div></label>
+            <Button onClick={() => void loadDevices().catch((error) => showNotice(error instanceof Error ? error.message : "Apparaten laden lukte niet.", "error"))} variant="outline" className="h-11 w-full border-white/10 bg-white/[.06] text-white hover:bg-white/10">Ververs Spotify-apparaten</Button>
             {devices.length > 0 && <div><p className="mb-2 text-sm font-semibold">Spotify-apparaat</p><div className="grid gap-2">{devices.map((device) => <button key={device.id} onClick={() => setSelectedDevice(device.id)} className={`flex items-center justify-between rounded-xl border p-3 text-left ${selectedDevice === device.id ? "border-[#64f5a4] bg-[#64f5a4]/10" : "border-white/10 bg-white/[.04]"}`}><span><strong className="block">{device.name}</strong><span className="text-xs text-zinc-500">{device.type}</span></span>{device.is_active && <span className="text-xs font-bold text-[#64f5a4]">Actief</span>}</button>)}</div></div>}
             <AlertDialog><AlertDialogTrigger asChild><Button variant="outline" className="w-full rounded-xl border-red-400/25 bg-red-400/5 text-red-200 hover:bg-red-400/15 hover:text-red-100"><RotateCcw size={16}/>Nieuwe sessie</Button></AlertDialogTrigger><AlertDialogContent className="border-white/10 bg-[#101914] text-white"><AlertDialogHeader><AlertDialogTitle>Nieuwe muzieksessie starten?</AlertDialogTitle><AlertDialogDescription className="text-zinc-400">Alle oude verzoeken en stemmen worden definitief gewist. De Spotify-koppeling blijft bewaard.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel className="border-white/10 bg-white/[.04] text-white hover:bg-white/10 hover:text-white">Annuleren</AlertDialogCancel><AlertDialogAction onClick={() => void startNewParty()} disabled={busyId === -3} className="bg-red-500 font-bold text-white hover:bg-red-400">Wis lijst en start opnieuw</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
             <Button onClick={() => setShowHost(false)} variant="outline" className="w-full border-white/10 bg-white/[.04] text-white hover:bg-white/10">Terug naar de hostlijst</Button>
           </div>}
-        </section>
-      </div>}
+      </DialogContent></Dialog>
     </main>
   );
 }

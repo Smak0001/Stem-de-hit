@@ -1,8 +1,9 @@
-import { apiError, assertAdmin, spotifyFetch } from "@/lib/spotify";
+import { assertHostRequest } from "@/lib/host-auth";
+import { apiError, spotifyFetch } from "@/lib/spotify";
 
-export async function GET(request: Request) {
+export async function POST(request: Request) {
   try {
-    assertAdmin(new URL(request.url).searchParams.get("adminCode"));
+    await assertHostRequest(request);
     const data = await spotifyFetch("/me/player/devices") as { devices: unknown[] };
     return Response.json({ devices: data.devices });
   } catch (error) {
