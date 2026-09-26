@@ -16,7 +16,7 @@ export async function POST(request: Request) {
       body: JSON.stringify({ uris: [track.uri], position_ms: 0 }),
     });
     await markQueued(track.id);
-    return Response.json({ played: true, itemId: track.id, name: track.name });
+    return Response.json({ played: true, itemId: track.id, name: track.name, spotifyId: track.uri.split(":").pop() || "" });
   } catch (error) {
     return apiError(error);
   }

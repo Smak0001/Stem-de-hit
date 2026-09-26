@@ -1,9 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, ChevronUp, Copy, Headphones, Loader2, LockKeyhole, Music2, PartyPopper, Play, Search, Settings2, Smartphone, Sparkles, Users, Volume2, X } from "lucide-react";
+import { Check, ChevronUp, Copy, Headphones, Loader2, LockKeyhole, Music2, PartyPopper, Play, RotateCcw, Search, Settings2, Smartphone, Sparkles, Users, Volume2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
 
 type Track = { id: number; spotifyId: string; uri: string; name: string; artist: string; album: string; imageUrl: string | null; durationMs: number; votes: number; hasVoted: boolean; status: string };
 type SearchTrack = Omit<Track, "id" | "votes" | "hasVoted" | "status">;
@@ -48,6 +49,10 @@ export default function PartyApp() {
   const [playback, setPlayback] = useState<Playback>({ active: false });
   const [autoDj, setAutoDj] = useState(true);
   const triggeredFor = useRef("");
+  const lastPlaybackId = useRef<string | null>(null);
+  const autoDjBusy = useRef(false);
+  const inactivePolls = useRef(0);
+  const expectedPlayback = useRef<{ spotifyId: string; until: number } | null>(null);
 
   const refresh = useCallback(async () => {
     const data = await jsonFetch(`/api/state?voterId=${encodeURIComponent(getVoterId())}`);
@@ -65,9 +70,9 @@ export default function PartyApp() {
   }, [refresh]);
 
   useEffect(() => {
-    const loadPlayback = () => void jsonFetch("/api/playback").then(setPlayback).catch(() => setPlayback({ active: false }));
+    const loadPlayback = () => void jsonFetch("/api/playback", { cache: "no-store" }).then(setPlayback).catch(() => setPlayback({ active: false }));
     loadPlayback();
-    const timer = setInterval(loadPlayback, 4000);
+    const timer = setInterval(loadPlayback, 2000);
     return () => clearInterval(timer);
   }, [configured]);
 
@@ -93,15 +98,38 @@ export default function PartyApp() {
   const topTrack = candidateTracks[0];
 
   useEffect(() => {
-    if (!hostMode || !autoDj || !adminCode || !topTrack || !playback.active || !playback.isPlaying || !playback.item) return;
+    if (!hostMode || !autoDj || !adminCode || !topTrack) return;
+    if (!playback.active || !playback.item) {
+      if (lastPlaybackId.current && ++inactivePolls.current >= 2 && triggeredFor.current !== lastPlaybackId.current && !autoDjBusy.current) {
+        triggeredFor.current = lastPlaybackId.current;
+        void playNext(undefined, true);
+      }
+      return;
+    }
+    inactivePolls.current = 0;
+    const currentId = playback.item.spotifyId;
+    if (expectedPlayback.current) {
+      if (currentId === expectedPlayback.current.spotifyId) { expectedPlayback.current = null; lastPlaybackId.current = currentId; return; }
+      else if (Date.now() < expectedPlayback.current.until) { lastPlaybackId.current = currentId; return; }
+      else expectedPlayback.current = null;
+    }
+    const changedNaturally = lastPlaybackId.current !== null && lastPlaybackId.current !== currentId;
     const remaining = playback.item.durationMs - Number(playback.progressMs || 0);
-    if (remaining > 0 && remaining <= 9000 && triggeredFor.current !== playback.item.spotifyId) {
-      triggeredFor.current = playback.item.spotifyId;
+    const finishedWithoutNextTrack = !playback.isPlaying && remaining >= 0 && remaining <= 3000;
+    lastPlaybackId.current = currentId;
+    if ((changedNaturally || finishedWithoutNextTrack) && triggeredFor.current !== currentId && !autoDjBusy.current) {
+      triggeredFor.current = currentId;
       void playNext(undefined, true);
     }
-  // playNext is intentionally called only when a freshly-polled playback snapshot reaches the transition window.
+  // Auto-DJ reacts to a real Spotify track transition or to playback ending without a next track.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playback, hostMode, autoDj, adminCode, topTrack?.id]);
+
+  useEffect(() => {
+    if (hostMode && configured && adminCode && devices.length === 0) void loadDevices(adminCode).catch(() => undefined);
+  // Load the active Spotify device once when the host page is reopened.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostMode, configured, adminCode]);
   async function search(event: React.FormEvent) {
     event.preventDefault(); if (query.trim().length < 2) return;
     setSearching(true); setNotice("");
@@ -157,13 +185,24 @@ export default function PartyApp() {
 
   async function playNext(itemId?: number, automatic = false) {
     setBusyId(itemId ?? -2);
+    if (automatic) autoDjBusy.current = true;
     try {
       const data = await jsonFetch("/api/host/play-next", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode, itemId, deviceId: selectedDevice || undefined }) });
+      expectedPlayback.current = { spotifyId: data.spotifyId, until: Date.now() + 10_000 };
       setNotice(automatic ? `${data.name} is als winnaar gestart.` : `${data.name} speelt nu op Spotify.`);
       await refresh();
-      const latest = await jsonFetch("/api/playback").catch(() => null); if (latest) setPlayback(latest);
+      const latest = await jsonFetch("/api/playback", { cache: "no-store" }).catch(() => null);
+      if (latest?.item?.spotifyId) lastPlaybackId.current = latest.item.spotifyId;
+      if (latest) setPlayback(latest);
     }
-    catch (error) { setNotice(error instanceof Error ? error.message : "Afspelen op Spotify lukte niet."); }
+    catch (error) { if (automatic) triggeredFor.current = ""; setNotice(error instanceof Error ? error.message : "Afspelen op Spotify lukte niet."); }
+    finally { setBusyId(null); autoDjBusy.current = false; }
+  }
+
+  async function startNewParty() {
+    setBusyId(-3); setNotice("");
+    try { await jsonFetch("/api/host/reset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode }) }); setTracks([]); setResults([]); setQuery(""); triggeredFor.current = ""; setNotice("Nieuwe sessie gestart. De oude verzoeken en stemmen zijn gewist."); await refresh(); }
+    catch (error) { setNotice(error instanceof Error ? error.message : "Nieuwe sessie starten lukte niet."); }
     finally { setBusyId(null); }
   }
 
@@ -174,6 +213,7 @@ export default function PartyApp() {
         <Button variant="ghost" className="rounded-full text-zinc-300 hover:bg-white/10 hover:text-white" onClick={() => setShowHost(!showHost)}><Settings2 size={17}/><span className="hidden sm:inline">Host</span></Button>
       </header>
       {hostMode && <div className="mx-auto mb-2 max-w-6xl px-4 sm:px-8"><div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#64f5a4]/25 bg-[#64f5a4]/10 px-4 py-3 text-sm text-[#baffd4]"><span><strong>Auto-DJ staat {autoDj ? "aan" : "uit"}.</strong> Laat deze hostpagina open; de winnaar start automatisch aan het einde van het huidige nummer.</span><Button size="sm" variant="outline" onClick={() => { const next = !autoDj; setAutoDj(next); localStorage.setItem("stem-de-hit-auto-dj", String(next)); }} className="border-[#64f5a4]/30 bg-transparent text-[#baffd4] hover:bg-[#64f5a4]/15 hover:text-white">{autoDj ? "Uitzetten" : "Aanzetten"}</Button></div></div>}
+      {hostMode && <div className="mx-auto flex max-w-6xl justify-end px-4 pt-2 sm:px-8"><AlertDialog><AlertDialogTrigger asChild><Button variant="outline" className="rounded-xl border-red-400/25 bg-red-400/5 text-red-200 hover:bg-red-400/15 hover:text-red-100"><RotateCcw size={16}/>Nieuwe sessie</Button></AlertDialogTrigger><AlertDialogContent className="border-white/10 bg-[#101914] text-white"><AlertDialogHeader><AlertDialogTitle>Nieuwe muzieksessie starten?</AlertDialogTitle><AlertDialogDescription className="text-zinc-400">Alle oude verzoeken en stemmen worden definitief gewist. De Spotify-koppeling blijft bewaard.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel className="border-white/10 bg-white/[.04] text-white hover:bg-white/10 hover:text-white">Annuleren</AlertDialogCancel><AlertDialogAction onClick={() => void startNewParty()} disabled={busyId === -3} className="bg-red-500 font-bold text-white hover:bg-red-400">Wis lijst en start opnieuw</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog></div>}
       <section className="mx-auto grid max-w-6xl gap-6 px-4 pb-16 pt-3 sm:px-8 lg:grid-cols-[minmax(0,1fr)_360px] lg:pt-8">
         <div>
           <div className="mb-7 max-w-2xl"><p className="mb-3 flex items-center gap-2 text-sm font-bold uppercase tracking-[.18em] text-[#64f5a4]"><PartyPopper size={16}/> Jij bepaalt wat hierna komt</p><h1 className="text-4xl font-black leading-[.98] tracking-[-.055em] sm:text-6xl">Zoek. Stem.<br/><span className="text-zinc-500">Zet de avond aan.</span></h1></div>
@@ -185,7 +225,23 @@ export default function PartyApp() {
         </div>
         <aside className="space-y-5 lg:sticky lg:top-6 lg:self-start">{playback.active && playback.item && <div className="overflow-hidden rounded-[28px] border border-[#64f5a4]/20 bg-[#0d1d15] p-5 shadow-[0_30px_80px_rgba(0,0,0,.35)]"><div className="mb-4 flex items-center justify-between"><span className="flex items-center gap-2 rounded-full bg-[#64f5a4] px-3 py-1 text-xs font-black uppercase tracking-wider text-[#07110d]"><Volume2 size={13}/>Nu speelt</span><span className="text-xs text-zinc-500">{playback.isPlaying ? playback.device?.name || "Spotify" : "Gepauzeerd"}</span></div><div className="flex items-center gap-4">{playback.item.imageUrl ? <img src={playback.item.imageUrl} alt="Albumhoes" className="h-20 w-20 rounded-2xl object-cover"/> : <span className="grid h-20 w-20 place-items-center rounded-2xl bg-white/10"><Music2/></span>}<div className="min-w-0"><h2 className="truncate text-xl font-black tracking-tight">{playback.item.name}</h2><p className="truncate text-sm text-zinc-400">{playback.item.artist}</p><p className="mt-2 text-xs text-zinc-600">{formatDuration(playback.progressMs || 0)} / {formatDuration(playback.item.durationMs)}</p></div></div><div className="mt-4 h-1.5 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-[#64f5a4] transition-all" style={{ width: `${Math.min(100, Math.max(0, ((playback.progressMs || 0) / Math.max(1, playback.item.durationMs)) * 100))}%` }}/></div></div>}{topTrack && <div className="overflow-hidden rounded-[28px] border border-white/10 bg-white/[.06] p-5 shadow-[0_30px_80px_rgba(0,0,0,.35)]"><div className="mb-4 flex items-center justify-between"><span className="rounded-full bg-[#64f5a4] px-3 py-1 text-xs font-black uppercase tracking-wider text-[#07110d]">Hierna #1</span><span className="text-sm font-bold text-[#64f5a4]">{topTrack.votes} stemmen</span></div>{topTrack.imageUrl && <img src={topTrack.imageUrl} alt="Albumhoes" className="aspect-square w-full rounded-2xl object-cover"/>}<h2 className="mt-4 truncate text-2xl font-black tracking-tight">{topTrack.name}</h2><p className="truncate text-zinc-400">{topTrack.artist}</p></div>}<div className="rounded-[28px] border border-white/10 bg-[#0e1914] p-5"><div className="mb-4 flex items-center gap-3"><span className="grid h-10 w-10 place-items-center rounded-xl bg-white/10"><Smartphone size={20}/></span><div><h3 className="font-bold">Laat anderen meestemmen</h3><p className="text-xs text-zinc-500">Scan met de camera</p></div></div><div className="mx-auto mb-4 grid aspect-square w-44 place-items-center overflow-hidden rounded-2xl bg-white p-3">{shareUrl ? <img src={`https://quickchart.io/qr?text=${encodeURIComponent(shareUrl)}&size=220&margin=1`} alt="QR-code naar deze verzoeklijst" className="h-full w-full"/> : <Loader2 className="animate-spin text-[#07110d]"/>}</div><Button variant="outline" disabled={!shareUrl} onClick={() => { void navigator.clipboard.writeText(shareUrl); setNotice("Link gekopieerd."); }} className="w-full rounded-xl border-white/10 bg-white/[.04] text-white hover:bg-white/10 hover:text-white"><Copy size={16}/>Kopieer link</Button></div></aside>
       </section>
-      {(showHost || hostMode) && <div className="fixed inset-0 z-50 grid place-items-end bg-black/70 p-0 backdrop-blur-sm sm:place-items-center sm:p-5" onMouseDown={(e) => { if (e.target === e.currentTarget && !hostMode) setShowHost(false); }}><section className="max-h-[92vh] w-full max-w-xl overflow-y-auto rounded-t-[28px] border border-white/10 bg-[#101914] p-6 shadow-2xl sm:rounded-[28px] sm:p-8"><div className="mb-6 flex items-start justify-between"><div><p className="mb-2 flex items-center gap-2 text-sm font-bold text-[#64f5a4]"><LockKeyhole size={16}/>Alleen voor de host</p><h2 className="text-3xl font-black tracking-tight">Bedien de avond</h2></div>{!hostMode && <button onClick={() => setShowHost(false)}><X/></button>}</div>{!configured ? <div className="space-y-4"><p className="text-sm leading-6 text-zinc-400">Maak in het Spotify Developer Dashboard een app aan en voeg deze exacte Redirect URI toe:</p><code className="block overflow-x-auto rounded-xl bg-black/30 p-3 text-xs text-[#9cfbc4]">{shareUrl}?host=1</code><label className="block text-sm font-semibold">Spotify Client ID<Input value={clientId} onChange={(e) => setClientId(e.target.value)} className="mt-2 h-12 border-white/10 bg-white/[.06]" placeholder="Bijvoorbeeld 1a2b3c…"/></label><label className="block text-sm font-semibold">Beheercode<Input type="password" value={adminCode} onChange={(e) => setAdminCode(e.target.value)} className="mt-2 h-12 border-white/10 bg-white/[.06]" placeholder="De code die je van ons krijgt"/></label><Button onClick={beginSpotifyLogin} className="h-12 w-full rounded-xl bg-[#64f5a4] font-black text-[#07110d] hover:bg-[#8affba]">Koppel met Spotify</Button></div> : <div className="space-y-5"><div className="rounded-2xl border border-[#64f5a4]/20 bg-[#64f5a4]/10 p-4 text-sm text-[#bcffd7]"><strong className="flex items-center gap-2"><Check size={17}/>Spotify is gekoppeld</strong><p className="mt-1 text-[#8bd7aa]">Laat Spotify spelen op de laptop en kies dat apparaat hieronder.</p></div><label className="block text-sm font-semibold">Beheercode<div className="mt-2 flex gap-2"><Input type="password" value={adminCode} onChange={(e) => setAdminCode(e.target.value)} className="h-11 border-white/10 bg-white/[.06]"/><Button onClick={() => loadDevices()} variant="outline" className="h-11 border-white/10 bg-white/[.06] text-white hover:bg-white/10">Ververs</Button></div></label>{devices.length > 0 && <div><p className="mb-2 text-sm font-semibold">Spotify-apparaat</p><div className="grid gap-2">{devices.map((device) => <button key={device.id} onClick={() => setSelectedDevice(device.id)} className={`flex items-center justify-between rounded-xl border p-3 text-left ${selectedDevice === device.id ? "border-[#64f5a4] bg-[#64f5a4]/10" : "border-white/10 bg-white/[.04]"}`}><span><strong className="block">{device.name}</strong><span className="text-xs text-zinc-500">{device.type}</span></span>{device.is_active && <span className="text-xs font-bold text-[#64f5a4]">Actief</span>}</button>)}</div></div>}<Button onClick={() => { location.href = "/"; }} variant="outline" className="w-full border-white/10 bg-white/[.04] text-white hover:bg-white/10">Bekijk gastweergave</Button></div>}</section></div>}
+      {showHost && <div className="fixed inset-0 z-50 grid place-items-end bg-black/70 p-0 backdrop-blur-sm sm:place-items-center sm:p-5" onMouseDown={(e) => { if (e.target === e.currentTarget) setShowHost(false); }}>
+        <section className="max-h-[92vh] w-full max-w-xl overflow-y-auto rounded-t-[28px] border border-white/10 bg-[#101914] p-6 shadow-2xl sm:rounded-[28px] sm:p-8">
+          <div className="mb-6 flex items-start justify-between"><div><p className="mb-2 flex items-center gap-2 text-sm font-bold text-[#64f5a4]"><LockKeyhole size={16}/>Alleen voor de host</p><h2 className="text-3xl font-black tracking-tight">Bedien de avond</h2></div><button onClick={() => setShowHost(false)} aria-label="Sluiten"><X/></button></div>
+          {!configured ? <div className="space-y-4">
+            <p className="text-sm leading-6 text-zinc-400">Maak in het Spotify Developer Dashboard een app aan en voeg deze exacte Redirect URI toe:</p>
+            <code className="block overflow-x-auto rounded-xl bg-black/30 p-3 text-xs text-[#9cfbc4]">{shareUrl}?host=1</code>
+            <label className="block text-sm font-semibold">Spotify Client ID<Input value={clientId} onChange={(e) => setClientId(e.target.value)} className="mt-2 h-12 border-white/10 bg-white/[.06]" placeholder="Bijvoorbeeld 1a2b3c…"/></label>
+            <label className="block text-sm font-semibold">Beheercode<Input type="password" value={adminCode} onChange={(e) => setAdminCode(e.target.value)} className="mt-2 h-12 border-white/10 bg-white/[.06]" placeholder="De code die je van ons krijgt"/></label>
+            <Button onClick={beginSpotifyLogin} className="h-12 w-full rounded-xl bg-[#64f5a4] font-black text-[#07110d] hover:bg-[#8affba]">Koppel met Spotify</Button>
+          </div> : <div className="space-y-5">
+            <div className="rounded-2xl border border-[#64f5a4]/20 bg-[#64f5a4]/10 p-4 text-sm text-[#bcffd7]"><strong className="flex items-center gap-2"><Check size={17}/>Spotify is gekoppeld</strong><p className="mt-1 text-[#8bd7aa]">Laat Spotify spelen op de laptop en kies dat apparaat hieronder.</p></div>
+            <label className="block text-sm font-semibold">Beheercode<div className="mt-2 flex gap-2"><Input type="password" value={adminCode} onChange={(e) => setAdminCode(e.target.value)} className="h-11 border-white/10 bg-white/[.06]"/><Button onClick={() => loadDevices()} variant="outline" className="h-11 border-white/10 bg-white/[.06] text-white hover:bg-white/10">Ververs</Button></div></label>
+            {devices.length > 0 && <div><p className="mb-2 text-sm font-semibold">Spotify-apparaat</p><div className="grid gap-2">{devices.map((device) => <button key={device.id} onClick={() => setSelectedDevice(device.id)} className={`flex items-center justify-between rounded-xl border p-3 text-left ${selectedDevice === device.id ? "border-[#64f5a4] bg-[#64f5a4]/10" : "border-white/10 bg-white/[.04]"}`}><span><strong className="block">{device.name}</strong><span className="text-xs text-zinc-500">{device.type}</span></span>{device.is_active && <span className="text-xs font-bold text-[#64f5a4]">Actief</span>}</button>)}</div></div>}
+            <Button onClick={() => setShowHost(false)} variant="outline" className="w-full border-white/10 bg-white/[.04] text-white hover:bg-white/10">Terug naar de hostlijst</Button>
+          </div>}
+        </section>
+      </div>}
     </main>
   );
 }

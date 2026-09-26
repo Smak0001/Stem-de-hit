@@ -10,3 +10,4 @@ export async function addVote(itemId: number, voterId: string) { const db = data
 export async function getTrack(itemId: number) { return database().prepare("SELECT id, uri, name, status FROM suggestions WHERE id = ?").bind(itemId).first<{ id: number; uri: string; name: string; status: string }>(); }
 export async function getTopCandidate() { return database().prepare(`SELECT s.id, s.uri, s.name, s.status FROM suggestions s LEFT JOIN votes v ON v.suggestion_id = s.id WHERE s.status = 'candidate' GROUP BY s.id ORDER BY COUNT(v.id) DESC, s.created_at ASC LIMIT 1`).first<{ id: number; uri: string; name: string; status: string }>(); }
 export async function markQueued(itemId: number) { await database().prepare("UPDATE suggestions SET status = 'queued' WHERE id = ?").bind(itemId).run(); }
+export async function resetParty() { const db = database(); await db.batch([db.prepare("DELETE FROM votes"), db.prepare("DELETE FROM suggestions")]); }

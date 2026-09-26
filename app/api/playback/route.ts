@@ -17,7 +17,7 @@ type SpotifyPlayback = {
 export async function GET() {
   try {
     const playback = await spotifyFetch("/me/player?additional_types=track") as SpotifyPlayback | null;
-    if (!playback?.item) return Response.json({ active: false });
+    if (!playback?.item) return Response.json({ active: false }, { headers: { "Cache-Control": "no-store" } });
     return Response.json({
       active: true,
       isPlaying: Boolean(playback.is_playing),
@@ -32,7 +32,7 @@ export async function GET() {
         durationMs: Number(playback.item.duration_ms || 0),
       },
       device: playback.device ? { id: playback.device.id || "", name: playback.device.name || "Spotify", type: playback.device.type || "" } : null,
-    });
+    }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     return apiError(error, 503);
   }
