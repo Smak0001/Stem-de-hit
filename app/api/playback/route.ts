@@ -33,13 +33,26 @@ type PlaybackSnapshot = {
 let cachedSnapshot: { value: PlaybackSnapshot; expiresAt: number } | null = null;
 let pendingSnapshot: Promise<PlaybackSnapshot> | null = null;
 
+async function spotifyWithDeadline<T>(path: string, timeoutMs: number) {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => { controller.abort(); reject(new Error("Spotify reageerde niet op tijd.")); }, timeoutMs);
+  });
+  try {
+    return await Promise.race([spotifyFetch(path, { signal: controller.signal }) as Promise<T>, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function loadSnapshot() {
   if (cachedSnapshot && cachedSnapshot.expiresAt > Date.now()) return cachedSnapshot.value;
   if (pendingSnapshot) return pendingSnapshot;
   pendingSnapshot = (async () => {
     const [playback, queueData] = await Promise.all([
-      spotifyFetch("/me/player?additional_types=track") as Promise<SpotifyPlayback | null>,
-      spotifyFetch("/me/player/queue").catch(() => null) as Promise<{ queue?: SpotifyTrack[] } | null>,
+      spotifyWithDeadline<SpotifyPlayback | null>("/me/player?additional_types=track", 4_000),
+      spotifyWithDeadline<{ queue?: SpotifyTrack[] } | null>("/me/player/queue", 1_500).catch(() => null),
     ]);
     const queue = (queueData?.queue || []).filter((track) => track?.uri?.startsWith("spotify:track:")).slice(0, 20).map(mapTrack);
     const value: PlaybackSnapshot = playback?.item ? {
@@ -68,6 +81,12 @@ export async function GET(request: Request) {
     }
     return Response.json(snapshot, { headers: { "Cache-Control": "private, no-store", "Vary": "Cookie" } });
   } catch (error) {
+    if (cachedSnapshot) {
+      const isHost = await isHostRequest(request);
+      const fallback: PlaybackSnapshot & { stale: true } = { ...cachedSnapshot.value, stale: true };
+      if (!isHost) delete fallback.device;
+      return Response.json(fallback, { headers: { "Cache-Control": "private, no-store", "Vary": "Cookie", "X-Playback-Stale": "1" } });
+    }
     return apiError(error, 503);
   }
 }
