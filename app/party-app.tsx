@@ -56,6 +56,8 @@ export default function PartyApp() {
   const autoDjBusy = useRef(false);
   const inactivePolls = useRef(0);
   const expectedPlayback = useRef<{ spotifyId: string; until: number } | null>(null);
+  const allowedRequestCurrent = useRef<string | null>(null);
+  const duplicateSkipInProgress = useRef<string | null>(null);
 
   const refresh = useCallback(async () => {
     const data = await jsonFetch(`/api/state?voterId=${encodeURIComponent(getVoterId())}`);
@@ -107,9 +109,9 @@ export default function PartyApp() {
   }, [hostMode, topTrack?.id]);
 
   useEffect(() => {
-    if (!hostMode || !autoDj || !adminCode || !topTrack) return;
+    if (!hostMode || !autoDj || !adminCode) return;
     if (!playback.active || !playback.item) {
-      if (lastPlaybackId.current && ++inactivePolls.current >= 2 && triggeredFor.current !== lastPlaybackId.current && !autoDjBusy.current) {
+      if (topTrack && lastPlaybackId.current && ++inactivePolls.current >= 2 && triggeredFor.current !== lastPlaybackId.current && !autoDjBusy.current) {
         triggeredFor.current = lastPlaybackId.current;
         void playNext(undefined, true);
       }
@@ -117,11 +119,23 @@ export default function PartyApp() {
     }
     inactivePolls.current = 0;
     const currentId = playback.item.spotifyId;
+    if (lastPlaybackId.current !== currentId) {
+      if (allowedRequestCurrent.current && allowedRequestCurrent.current !== currentId) allowedRequestCurrent.current = null;
+      if (duplicateSkipInProgress.current && duplicateSkipInProgress.current !== currentId) duplicateSkipInProgress.current = null;
+    }
     if (expectedPlayback.current) {
-      if (currentId === expectedPlayback.current.spotifyId) { expectedPlayback.current = null; lastPlaybackId.current = currentId; return; }
+      if (currentId === expectedPlayback.current.spotifyId) { allowedRequestCurrent.current = currentId; expectedPlayback.current = null; lastPlaybackId.current = currentId; return; }
       else if (Date.now() < expectedPlayback.current.until) { lastPlaybackId.current = currentId; return; }
       else expectedPlayback.current = null;
     }
+    const isPlayedRequest = tracks.some((track) => track.status !== "candidate" && track.spotifyId === currentId);
+    if (isPlayedRequest && allowedRequestCurrent.current !== currentId && duplicateSkipInProgress.current !== currentId) {
+      duplicateSkipInProgress.current = currentId;
+      lastPlaybackId.current = currentId;
+      void skipDuplicate(playback.item.name);
+      return;
+    }
+    if (!topTrack) { lastPlaybackId.current = currentId; return; }
     const changedNaturally = lastPlaybackId.current !== null && lastPlaybackId.current !== currentId;
     const remaining = playback.item.durationMs - Number(playback.progressMs || 0);
     const readyToQueue = Boolean(playback.isPlaying) && remaining > 0 && remaining <= 12_000;
@@ -133,7 +147,7 @@ export default function PartyApp() {
     }
   // Auto-DJ reacts to a real Spotify track transition or to playback ending without a next track.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playback, hostMode, autoDj, adminCode, topTrack?.id]);
+  }, [playback, hostMode, autoDj, adminCode, topTrack?.id, tracks]);
 
   useEffect(() => {
     if (hostMode && configured && adminCode && devices.length === 0) void loadDevices(adminCode).catch(() => undefined);
@@ -209,6 +223,16 @@ export default function PartyApp() {
     finally { setBusyId(null); autoDjBusy.current = false; }
   }
 
+  async function skipDuplicate(name: string) {
+    try {
+      await jsonFetch("/api/host/skip", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode, deviceId: selectedDevice || undefined }) });
+      setNotice(`${name} was al gekozen en is automatisch overgeslagen.`);
+    } catch (error) {
+      duplicateSkipInProgress.current = null;
+      setNotice(error instanceof Error ? error.message : "Dubbel nummer overslaan lukte niet.");
+    }
+  }
+
   async function startNewParty() {
     setBusyId(-3); setNotice("");
     try { await jsonFetch("/api/host/reset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode }) }); setTracks([]); setResults([]); setQuery(""); triggeredFor.current = ""; setNotice("Nieuwe sessie gestart. De oude verzoeken en stemmen zijn gewist."); await refresh(); }
@@ -238,7 +262,7 @@ export default function PartyApp() {
           <div className="min-h-0 divide-y divide-white/[.07] overflow-hidden">
             {shownTracks.map((track, index) => <article key={track.id} className={`group flex items-center gap-3 ${hostMode ? "py-2" : "py-4"}`}><span className={`w-6 text-center text-sm font-black ${index === 0 ? "text-[#64f5a4]" : "text-zinc-600"}`}>{index + 1}</span>{track.imageUrl ? <img src={track.imageUrl} alt="" className={`${hostMode ? "h-11 w-11" : "h-14 w-14"} rounded-xl object-cover shadow-lg`}/> : <span className={`${hostMode ? "h-11 w-11" : "h-14 w-14"} grid place-items-center rounded-xl bg-white/10`}><Music2/></span>}<div className="min-w-0 flex-1"><h3 className="truncate font-bold">{track.name}</h3><p className="truncate text-sm text-zinc-500">{track.artist} · {formatDuration(track.durationMs)}</p></div>{hostMode ? <div className="flex items-center gap-2"><span className="flex min-w-20 items-center justify-center gap-1 rounded-xl border border-[#64f5a4]/25 bg-[#64f5a4]/10 px-3 py-2 text-sm font-black text-[#64f5a4]"><Users size={15}/>{track.votes}</span><Button size="sm" onClick={() => playNext(track.id)} disabled={busyId === track.id} className="rounded-xl bg-white/10 text-white hover:bg-[#64f5a4] hover:text-[#07110d]"><Play size={16}/><span className="hidden xl:inline">Speel nu</span></Button></div> : <button onClick={() => vote(track.id)} disabled={busyId === track.id || track.hasVoted} aria-label={`Stem op ${track.name}`} className={`flex min-w-16 items-center justify-center gap-1 rounded-xl border px-3 py-2 font-black transition ${track.hasVoted ? "border-[#64f5a4]/30 bg-[#64f5a4]/15 text-[#64f5a4]" : "border-white/10 bg-white/[.05] hover:-translate-y-0.5 hover:border-[#64f5a4]/50 hover:bg-[#64f5a4]/10"}`}>{track.hasVoted ? <Check size={17}/> : <ChevronUp size={18}/>} {track.votes}</button>}</article>)}
             {hostMode && candidateTracks.length > 5 && <div className="py-2 text-center text-sm text-zinc-500">+ {candidateTracks.length - 5} nummers volgen daarna</div>}
-            {candidateTracks.length === 0 && playback.queue && playback.queue.length > 0 ? <div className={hostMode ? "py-3" : "py-5"}><div className="mb-3 flex items-center gap-2 text-sm font-bold text-[#64f5a4]"><Headphones size={17}/>Spotify gaat automatisch verder — stem om de volgorde te veranderen</div><div className="grid gap-2">{playback.queue.slice(0, hostMode ? 4 : undefined).map((track, index) => <div key={`${track.spotifyId}-${index}`} className="flex items-center gap-3 rounded-xl bg-white/[.04] p-2.5">{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-10 w-10 rounded-lg object-cover"/> : <span className="grid h-10 w-10 place-items-center rounded-lg bg-white/10"><Music2 size={17}/></span>}<span className="min-w-0 flex-1"><strong className="block truncate text-sm">{track.name}</strong><span className="block truncate text-xs text-zinc-500">{track.artist}</span></span>{hostMode ? <span className="text-xs font-bold text-zinc-600">{index + 1}</span> : <button onClick={() => add(track)} disabled={busyId === -1} aria-label={`Stem op ${track.name}`} className="flex min-w-20 items-center justify-center gap-1 rounded-xl border border-white/10 bg-white/[.05] px-3 py-2 text-sm font-black transition hover:-translate-y-0.5 hover:border-[#64f5a4]/50 hover:bg-[#64f5a4]/10 disabled:opacity-50"><ChevronUp size={17}/>Stem</button>}</div>)}</div></div> : candidateTracks.length === 0 && <div className={`grid place-items-center rounded-2xl border border-dashed border-white/10 text-center ${hostMode ? "min-h-40" : "min-h-52"}`}><div><Headphones className="mx-auto mb-3 text-zinc-600" size={32}/><p className="font-semibold text-zinc-300">De dansvloer wacht nog</p><p className="mt-1 text-sm text-zinc-600">Spotify speelt verder zodra daar een afspeellijst actief is.</p></div></div>}
+            {candidateTracks.length === 0 && playback.queue && playback.queue.length > 0 ? <div className={hostMode ? "py-3" : "py-5"}><div className="mb-3 flex items-center gap-2 text-sm font-bold text-[#64f5a4]"><Headphones size={17}/>Spotify gaat automatisch verder — stem om de volgorde te veranderen</div><div className="grid gap-2">{playback.queue.slice(0, hostMode ? 5 : undefined).map((track, index) => <div key={`${track.spotifyId}-${index}`} className="flex items-center gap-3 rounded-xl bg-white/[.04] p-2.5">{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-10 w-10 rounded-lg object-cover"/> : <span className="grid h-10 w-10 place-items-center rounded-lg bg-white/10"><Music2 size={17}/></span>}<span className="min-w-0 flex-1"><strong className="block truncate text-sm">{track.name}</strong><span className="block truncate text-xs text-zinc-500">{track.artist}</span></span>{hostMode ? <span className="text-xs font-bold text-zinc-600">{index + 1}</span> : <button onClick={() => add(track)} disabled={busyId === -1} aria-label={`Stem op ${track.name}`} className="flex min-w-20 items-center justify-center gap-1 rounded-xl border border-white/10 bg-white/[.05] px-3 py-2 text-sm font-black transition hover:-translate-y-0.5 hover:border-[#64f5a4]/50 hover:bg-[#64f5a4]/10 disabled:opacity-50"><ChevronUp size={17}/>Stem</button>}</div>)}</div></div> : candidateTracks.length === 0 && <div className={`grid place-items-center rounded-2xl border border-dashed border-white/10 text-center ${hostMode ? "min-h-40" : "min-h-52"}`}><div><Headphones className="mx-auto mb-3 text-zinc-600" size={32}/><p className="font-semibold text-zinc-300">De dansvloer wacht nog</p><p className="mt-1 text-sm text-zinc-600">Spotify speelt verder zodra daar een afspeellijst actief is.</p></div></div>}
           </div>
         </div>
 
