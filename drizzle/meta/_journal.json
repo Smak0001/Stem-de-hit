@@ -8,6 +8,13 @@
       "when": 1790375241669,
       "tag": "0000_glorious_marrow",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1790424883485,
+      "tag": "0001_vengeful_magneto",
+      "breakpoints": true
     }
   ]
 }

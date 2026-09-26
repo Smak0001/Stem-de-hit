@@ -1,4 +1,4 @@
-import { integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const settings = sqliteTable("settings", {
   key: text("key").primaryKey(), value: text("value").notNull(), updatedAt: integer("updated_at").notNull(),
@@ -9,3 +9,6 @@ export const suggestions = sqliteTable("suggestions", {
 export const votes = sqliteTable("votes", {
   id: integer("id").primaryKey({ autoIncrement: true }), suggestionId: integer("suggestion_id").notNull().references(() => suggestions.id, { onDelete: "cascade" }), voterId: text("voter_id").notNull(), createdAt: integer("created_at").notNull(),
 }, (table) => [uniqueIndex("idx_votes_suggestion_voter").on(table.suggestionId, table.voterId)]);
+export const reactions = sqliteTable("reactions", {
+  id: integer("id").primaryKey({ autoIncrement: true }), emoji: text("emoji").notNull(), voterId: text("voter_id").notNull(), createdAt: integer("created_at").notNull(),
+}, (table) => [index("idx_reactions_created_at").on(table.createdAt)]);
