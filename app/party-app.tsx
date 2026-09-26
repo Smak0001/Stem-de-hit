@@ -206,13 +206,9 @@ export default function PartyApp() {
   const [showQrCard, setShowQrCard] = useState(true);
   const triggeredFor = useRef("");
   const lastPlaybackId = useRef<string | null>(null);
-  const lastPlaybackProgress = useRef(0);
   const autoDjBusy = useRef(false);
   const inactivePolls = useRef(0);
   const expectedPlayback = useRef<{ spotifyId: string; itemId: number; until: number } | null>(null);
-  const leaderJustAcquired = useRef(false);
-  const allowedRequestCurrent = useRef<string | null>(null);
-  const duplicateSkipInProgress = useRef<string | null>(null);
   const previousLeaderId = useRef<number | null>(null);
   const previousPartyPlaybackId = useRef<string | null>(null);
   const milestoneVotes = useRef(new Map<number, number>());
@@ -338,7 +334,6 @@ export default function PartyApp() {
   useEffect(() => {
     if (!hostMode || !autoDj) { setAutoDjLeader(false); return; }
     if (!navigator.locks) {
-      leaderJustAcquired.current = true;
       setAutoDjLeader(true);
       return () => setAutoDjLeader(false);
     }
@@ -347,7 +342,6 @@ export default function PartyApp() {
     const holdLock = new Promise<void>((resolve) => { releaseLock = resolve; });
     void navigator.locks.request("stem-de-hit-auto-dj", { mode: "exclusive" }, async () => {
       if (cancelled) return;
-      leaderJustAcquired.current = true;
       setAutoDjLeader(true);
       await holdLock;
     }).finally(() => { if (!cancelled) setAutoDjLeader(false); });
@@ -373,24 +367,8 @@ export default function PartyApp() {
     }
     inactivePolls.current = 0;
     const currentId = playback.item.spotifyId;
-    const currentProgress = Number(playback.progressMs || 0);
-    const restartedSameTrack = lastPlaybackId.current === currentId && lastPlaybackProgress.current > 30_000 && currentProgress < 10_000;
-    if (restartedSameTrack) {
-      allowedRequestCurrent.current = null;
-      duplicateSkipInProgress.current = null;
-    }
-    lastPlaybackProgress.current = currentProgress;
-    if (lastPlaybackId.current !== currentId) {
-      if (allowedRequestCurrent.current && allowedRequestCurrent.current !== currentId) allowedRequestCurrent.current = null;
-      if (duplicateSkipInProgress.current && duplicateSkipInProgress.current !== currentId) duplicateSkipInProgress.current = null;
-    }
-    const isPlayedRequest = tracks.some((track) => track.status !== "candidate" && track.spotifyId === currentId);
-    if (leaderJustAcquired.current) {
-      leaderJustAcquired.current = false;
-      if (isPlayedRequest) allowedRequestCurrent.current = currentId;
-    }
     if (expectedPlayback.current) {
-      if (currentId === expectedPlayback.current.spotifyId) { allowedRequestCurrent.current = currentId; expectedPlayback.current = null; lastPlaybackId.current = currentId; return; }
+      if (currentId === expectedPlayback.current.spotifyId) { expectedPlayback.current = null; lastPlaybackId.current = currentId; return; }
       const changedBeforeWinner = lastPlaybackId.current !== null && lastPlaybackId.current !== currentId;
       if (changedBeforeWinner && !autoDjBusy.current) {
         const expected = expectedPlayback.current;
@@ -402,12 +380,6 @@ export default function PartyApp() {
       }
       else if (Date.now() < expectedPlayback.current.until) { lastPlaybackId.current = currentId; return; }
       else expectedPlayback.current = null;
-    }
-    if (isPlayedRequest && allowedRequestCurrent.current !== currentId && duplicateSkipInProgress.current !== currentId) {
-      duplicateSkipInProgress.current = currentId;
-      lastPlaybackId.current = currentId;
-      void skipDuplicate(playback.item.name);
-      return;
     }
     if (!topTrack) { lastPlaybackId.current = currentId; return; }
     const changedNaturally = lastPlaybackId.current !== null && lastPlaybackId.current !== currentId;
@@ -513,16 +485,6 @@ export default function PartyApp() {
     }
     catch (error) { if (automatic) triggeredFor.current = ""; setNotice(error instanceof Error ? error.message : "Afspelen op Spotify lukte niet."); }
     finally { setBusyId(null); autoDjBusy.current = false; }
-  }
-
-  async function skipDuplicate(name: string) {
-    try {
-      await jsonFetch("/api/host/skip", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode, deviceId: selectedDevice || undefined }) });
-      setNotice(`${name} was al gekozen en is automatisch overgeslagen.`);
-    } catch (error) {
-      duplicateSkipInProgress.current = null;
-      setNotice(error instanceof Error ? error.message : "Dubbel nummer overslaan lukte niet.");
-    }
   }
 
   async function startNewParty() {
