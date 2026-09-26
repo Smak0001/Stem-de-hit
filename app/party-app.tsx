@@ -52,6 +52,7 @@ export default function PartyApp() {
   const [autoDj, setAutoDj] = useState(true);
   const [partyMode, setPartyMode] = useState(false);
   const [partyQrOpen, setPartyQrOpen] = useState(false);
+  const [leaderCelebration, setLeaderCelebration] = useState(false);
   const [showQrCard, setShowQrCard] = useState(true);
   const triggeredFor = useRef("");
   const lastPlaybackId = useRef<string | null>(null);
@@ -60,6 +61,7 @@ export default function PartyApp() {
   const expectedPlayback = useRef<{ spotifyId: string; until: number } | null>(null);
   const allowedRequestCurrent = useRef<string | null>(null);
   const duplicateSkipInProgress = useRef<string | null>(null);
+  const previousLeaderId = useRef<number | null>(null);
 
   const refresh = useCallback(async () => {
     const data = await jsonFetch(`/api/state?voterId=${encodeURIComponent(getVoterId())}`);
@@ -104,6 +106,24 @@ export default function PartyApp() {
 
   const candidateTracks = tracks.filter((track) => track.status === "candidate");
   const topTrack = candidateTracks[0];
+  const candidateSpotifyIds = new Set(candidateTracks.map((track) => track.spotifyId));
+  const seenQueueIds = new Set<string>();
+  const spotifyQueueTracks = (playback.queue || []).filter((track) => {
+    if (!track.spotifyId || candidateSpotifyIds.has(track.spotifyId) || seenQueueIds.has(track.spotifyId)) return false;
+    seenQueueIds.add(track.spotifyId);
+    return true;
+  });
+
+  useEffect(() => {
+    if (!partyMode || !topTrack) { previousLeaderId.current = topTrack?.id || null; setLeaderCelebration(false); return; }
+    if (previousLeaderId.current !== null && previousLeaderId.current !== topTrack.id) {
+      setLeaderCelebration(true);
+      const timer = setTimeout(() => setLeaderCelebration(false), 4200);
+      previousLeaderId.current = topTrack.id;
+      return () => clearTimeout(timer);
+    }
+    previousLeaderId.current = topTrack.id;
+  }, [partyMode, topTrack?.id]);
 
   useEffect(() => {
     if (!hostMode || !topTrack) { setShowQrCard(true); return; }
@@ -244,6 +264,7 @@ export default function PartyApp() {
   }
 
   const shownTracks = hostMode ? candidateTracks.slice(0, 5) : candidateTracks;
+  const queueFillTracks = spotifyQueueTracks.slice(0, hostMode ? Math.max(0, 5 - shownTracks.length) : 5);
 
   return (
     <main className={`${hostMode ? "h-[100dvh] overflow-hidden" : "min-h-screen"} bg-[radial-gradient(circle_at_75%_5%,rgba(81,255,168,.13),transparent_28%),linear-gradient(145deg,#07110d_0%,#0d1813_52%,#050907_100%)] text-white`}>
@@ -266,7 +287,8 @@ export default function PartyApp() {
           <div className="min-h-0 divide-y divide-white/[.07] overflow-hidden">
             {shownTracks.map((track, index) => <article key={track.id} className={`group flex items-center gap-3 ${hostMode ? "py-2" : "py-4"}`}><span className={`w-6 text-center text-sm font-black ${index === 0 ? "text-[#64f5a4]" : "text-zinc-600"}`}>{index + 1}</span>{track.imageUrl ? <img src={track.imageUrl} alt="" className={`${hostMode ? "h-11 w-11" : "h-14 w-14"} rounded-xl object-cover shadow-lg`}/> : <span className={`${hostMode ? "h-11 w-11" : "h-14 w-14"} grid place-items-center rounded-xl bg-white/10`}><Music2/></span>}<div className="min-w-0 flex-1"><h3 className="truncate font-bold">{track.name}</h3><p className="truncate text-sm text-zinc-500">{track.artist} · {formatDuration(track.durationMs)}</p></div>{hostMode ? <div className="flex items-center gap-2"><span className="flex min-w-20 items-center justify-center gap-1 rounded-xl border border-[#64f5a4]/25 bg-[#64f5a4]/10 px-3 py-2 text-sm font-black text-[#64f5a4]"><Users size={15}/>{track.votes}</span><Button size="sm" onClick={() => playNext(track.id)} disabled={busyId === track.id} className="rounded-xl bg-white/10 text-white hover:bg-[#64f5a4] hover:text-[#07110d]"><Play size={16}/><span className="hidden xl:inline">Speel nu</span></Button></div> : <button onClick={() => vote(track.id)} disabled={busyId === track.id || track.hasVoted} aria-label={`Stem op ${track.name}`} className={`flex min-w-16 items-center justify-center gap-1 rounded-xl border px-3 py-2 font-black transition ${track.hasVoted ? "border-[#64f5a4]/30 bg-[#64f5a4]/15 text-[#64f5a4]" : "border-white/10 bg-white/[.05] hover:-translate-y-0.5 hover:border-[#64f5a4]/50 hover:bg-[#64f5a4]/10"}`}>{track.hasVoted ? <Check size={17}/> : <ChevronUp size={18}/>} {track.votes}</button>}</article>)}
             {hostMode && candidateTracks.length > 5 && <div className="py-2 text-center text-sm text-zinc-500">+ {candidateTracks.length - 5} nummers volgen daarna</div>}
-            {candidateTracks.length === 0 && playback.queue && playback.queue.length > 0 ? <div className={hostMode ? "py-3" : "py-5"}><div className="mb-3 flex items-center gap-2 text-sm font-bold text-[#64f5a4]"><Headphones size={17}/>Spotify gaat automatisch verder — stem om de volgorde te veranderen</div><div className="grid gap-2">{playback.queue.slice(0, hostMode ? 5 : undefined).map((track, index) => <div key={`${track.spotifyId}-${index}`} className="flex items-center gap-3 rounded-xl bg-white/[.04] p-2.5">{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-10 w-10 rounded-lg object-cover"/> : <span className="grid h-10 w-10 place-items-center rounded-lg bg-white/10"><Music2 size={17}/></span>}<span className="min-w-0 flex-1"><strong className="block truncate text-sm">{track.name}</strong><span className="block truncate text-xs text-zinc-500">{track.artist}</span></span>{hostMode ? <span className="text-xs font-bold text-zinc-600">{index + 1}</span> : <button onClick={() => add(track)} disabled={busyId === -1} aria-label={`Stem op ${track.name}`} className="flex min-w-20 items-center justify-center gap-1 rounded-xl border border-white/10 bg-white/[.05] px-3 py-2 text-sm font-black transition hover:-translate-y-0.5 hover:border-[#64f5a4]/50 hover:bg-[#64f5a4]/10 disabled:opacity-50"><ChevronUp size={17}/>Stem</button>}</div>)}</div></div> : candidateTracks.length === 0 && <div className={`grid place-items-center rounded-2xl border border-dashed border-white/10 text-center ${hostMode ? "min-h-40" : "min-h-52"}`}><div><Headphones className="mx-auto mb-3 text-zinc-600" size={32}/><p className="font-semibold text-zinc-300">De dansvloer wacht nog</p><p className="mt-1 text-sm text-zinc-600">Spotify speelt verder zodra daar een afspeellijst actief is.</p></div></div>}
+            {queueFillTracks.length > 0 && <div className={hostMode ? "py-2" : "py-5"}><div className="mb-2 flex items-center gap-2 text-sm font-bold text-[#64f5a4]"><Headphones size={17}/>{candidateTracks.length > 0 ? "Daarna uit Spotify" : "Spotify gaat automatisch verder"}</div><div className="grid gap-2">{queueFillTracks.map((track, index) => <div key={`${track.spotifyId}-${index}`} className="flex items-center gap-3 rounded-xl bg-white/[.04] p-2.5">{hostMode && <span className="w-6 text-center text-xs font-black text-zinc-600">{shownTracks.length + index + 1}</span>}{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-10 w-10 rounded-lg object-cover"/> : <span className="grid h-10 w-10 place-items-center rounded-lg bg-white/10"><Music2 size={17}/></span>}<span className="min-w-0 flex-1"><strong className="block truncate text-sm">{track.name}</strong><span className="block truncate text-xs text-zinc-500">{track.artist}</span></span>{hostMode ? <span className="rounded-lg bg-white/[.04] px-2 py-1 text-[11px] font-bold text-zinc-600">Spotify</span> : <button onClick={() => add(track)} disabled={busyId === -1} aria-label={`Stem op ${track.name}`} className="flex min-w-20 items-center justify-center gap-1 rounded-xl border border-white/10 bg-white/[.05] px-3 py-2 text-sm font-black transition hover:-translate-y-0.5 hover:border-[#64f5a4]/50 hover:bg-[#64f5a4]/10 disabled:opacity-50"><ChevronUp size={17}/>Stem</button>}</div>)}</div></div>}
+            {candidateTracks.length === 0 && queueFillTracks.length === 0 && <div className={`grid place-items-center rounded-2xl border border-dashed border-white/10 text-center ${hostMode ? "min-h-40" : "min-h-52"}`}><div><Headphones className="mx-auto mb-3 text-zinc-600" size={32}/><p className="font-semibold text-zinc-300">De dansvloer wacht nog</p><p className="mt-1 text-sm text-zinc-600">Spotify speelt verder zodra daar een afspeellijst actief is.</p></div></div>}
           </div>
         </div>
 
@@ -284,6 +306,8 @@ export default function PartyApp() {
       {hostMode && partyMode && <section className="fixed inset-0 z-40 overflow-hidden bg-[#050806] text-white">
         <div className="pointer-events-none absolute -left-[12vw] -top-[24vh] h-[70vh] w-[70vh] animate-pulse rounded-full bg-fuchsia-600/20 blur-[120px]"/>
         <div className="pointer-events-none absolute -bottom-[30vh] right-[2vw] h-[75vh] w-[75vh] animate-pulse rounded-full bg-[#64f5a4]/15 blur-[130px] [animation-delay:900ms]"/>
+        <div className="pointer-events-none absolute inset-0 overflow-hidden" aria-hidden="true">{["♪","♫","♪","♬","♫","♪"].map((note, index) => <span key={index} className="absolute animate-bounce font-black text-white/[.06]" style={{ left: `${8 + index * 17}%`, top: `${16 + (index % 3) * 25}%`, fontSize: `${28 + (index % 3) * 16}px`, animationDuration: `${3.8 + index * .55}s`, animationDelay: `${index * .45}s` }}>{note}</span>)}</div>
+        {leaderCelebration && topTrack && <div className="pointer-events-none absolute left-1/2 top-20 z-20 -translate-x-1/2 animate-bounce rounded-full border border-[#64f5a4]/30 bg-[#0a1710]/95 px-6 py-3 text-center shadow-[0_0_60px_rgba(100,245,164,.35)] backdrop-blur-xl"><p className="text-xs font-black uppercase tracking-[.2em] text-[#64f5a4]">Nieuwe nummer 1</p><p className="mt-1 max-w-sm truncate text-lg font-black">{topTrack.name}</p></div>}
         <div className="relative flex h-full flex-col p-5 lg:p-7">
           <header className="flex shrink-0 items-center justify-between gap-5"><div className="flex items-center gap-3"><span className="grid h-11 w-11 place-items-center rounded-2xl bg-[#64f5a4] text-[#07110d] shadow-[0_0_32px_rgba(100,245,164,.3)]"><Music2 size={23}/></span><div><p className="text-lg font-black tracking-tight">Stem de Hit</p><p className="text-xs font-bold uppercase tracking-[.22em] text-fuchsia-300">Party Mode</p></div></div><div className="flex items-center gap-2"><span className="hidden rounded-full border border-white/10 bg-white/[.05] px-3 py-2 text-sm font-bold text-zinc-300 sm:flex sm:items-center sm:gap-2"><Users size={15}/>{voterCount} {voterCount === 1 ? "stemmer" : "stemmers"}</span><Button variant="outline" onClick={() => void document.documentElement.requestFullscreen?.().catch(() => undefined)} className="rounded-xl border-white/10 bg-white/[.05] text-white hover:bg-white/10 hover:text-white"><Maximize2 size={17}/><span className="hidden sm:inline">Volledig scherm</span></Button><Button variant="outline" onClick={() => setShowHost(true)} className="rounded-xl border-white/10 bg-white/[.05] text-white hover:bg-white/10 hover:text-white"><Settings2 size={17}/><span className="hidden sm:inline">Instellingen</span></Button></div></header>
 
