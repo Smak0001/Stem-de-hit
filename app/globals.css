@@ -23,17 +23,3 @@
 html { background: #07110d; }
 body { margin: 0; background: var(--background); color: var(--foreground); font-family: var(--font-sans); }
 button, a, input { -webkit-tap-highlight-color: transparent; }
-
-@keyframes party-reaction-float {
-  0% { opacity: 0; transform: translate3d(0, 40px, 0) scale(.65) rotate(-8deg); }
-  12% { opacity: 1; transform: translate3d(0, 0, 0) scale(1.08) rotate(4deg); }
-  72% { opacity: 1; }
-  100% { opacity: 0; transform: translate3d(var(--reaction-drift, 35px), -72vh, 0) scale(1.35) rotate(14deg); }
-}
-.party-reaction {
-  animation: party-reaction-float 5.4s cubic-bezier(.22,.72,.25,1) forwards;
-  contain: layout paint;
-  text-shadow: 0 8px 16px rgba(0,0,0,.32);
-  transform: translateZ(0);
-  will-change: transform, opacity;
-}

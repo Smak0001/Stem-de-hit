@@ -12,6 +12,7 @@ type SearchTrack = Omit<Track, "id" | "votes" | "hasVoted" | "status">;
 type Device = { id: string; name: string; type: string; is_active: boolean };
 type Playback = { active: boolean; isPlaying?: boolean; progressMs?: number; item?: SearchTrack; queue?: SearchTrack[]; device?: { id: string; name: string; type: string } | null };
 type ReactionEvent = { id: number; emoji: string; createdAt: number };
+type ReactionParticle = ReactionEvent & { x: number; drift: number; rotation: number };
 
 const getVoterId = () => {
   let value = localStorage.getItem("stem-de-hit-voter");
@@ -31,6 +32,90 @@ const jsonFetch = async (url: string, options?: RequestInit): Promise<any> => {
 function formatDuration(ms: number) {
   const minutes = Math.floor(ms / 60000);
   return `${minutes}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, "0")}`;
+}
+
+function PartyReactionLayer() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const cursorRef = useRef(0);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context) return;
+    let stopped = false;
+    let frame: number | null = null;
+    let width = 0;
+    let height = 0;
+    let lastPaint = 0;
+    let particles: ReactionParticle[] = [];
+
+    const resize = () => {
+      const rect = canvas.getBoundingClientRect();
+      width = Math.max(1, Math.round(rect.width));
+      height = Math.max(1, Math.round(rect.height));
+      if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
+    };
+
+    const draw = (timestamp: number) => {
+      if (stopped) return;
+      if (timestamp - lastPaint < 22) { frame = requestAnimationFrame(draw); return; }
+      lastPaint = timestamp;
+      const now = Date.now();
+      particles = particles.filter((particle) => now - particle.createdAt < 5400);
+      context.clearRect(0, 0, width, height);
+      for (const particle of particles) {
+        const progress = Math.min(1, Math.max(0, (now - particle.createdAt) / 5400));
+        const eased = 1 - Math.pow(1 - progress, 2);
+        const opacity = progress < .12 ? progress / .12 : progress > .72 ? (1 - progress) / .28 : 1;
+        const scale = progress < .12 ? .65 + (progress / .12) * .43 : 1.08 + progress * .27;
+        const x = particle.x * width + particle.drift * eased;
+        const y = height - 42 - eased * height * .78;
+        context.save();
+        context.globalAlpha = Math.max(0, opacity);
+        context.translate(x, y);
+        context.rotate((particle.rotation * progress * Math.PI) / 180);
+        context.font = `${Math.round(48 * scale)}px "Segoe UI Emoji", "Apple Color Emoji", sans-serif`;
+        context.textAlign = "center";
+        context.textBaseline = "middle";
+        context.fillText(particle.emoji, 0, 0);
+        context.restore();
+      }
+      frame = particles.length > 0 ? requestAnimationFrame(draw) : null;
+    };
+
+    const startDrawing = () => { if (frame === null) frame = requestAnimationFrame(draw); };
+    const addReactions = (incoming: ReactionEvent[]) => {
+      particles.push(...incoming.map((reaction) => ({
+        ...reaction,
+        x: .08 + ((reaction.id * 37) % 82) / 100,
+        drift: (reaction.id % 2 === 0 ? 1 : -1) * (24 + (reaction.id % 4) * 12),
+        rotation: reaction.id % 2 === 0 ? 14 : -14,
+      })));
+      particles = particles.slice(-70);
+      startDrawing();
+    };
+
+    const loadReactions = () => void jsonFetch(`/api/reactions?since=${Date.now() - 6500}&afterId=${cursorRef.current}`, { cache: "no-store" }).then((data) => {
+      const incoming = (data.reactions || []) as ReactionEvent[];
+      if (incoming.length === 0) return;
+      cursorRef.current = incoming[incoming.length - 1].id;
+      addReactions(incoming);
+    }).catch(() => undefined);
+
+    const observer = new ResizeObserver(() => { resize(); startDrawing(); });
+    observer.observe(canvas);
+    resize();
+    loadReactions();
+    const pollTimer = setInterval(loadReactions, 300);
+    return () => {
+      stopped = true;
+      clearInterval(pollTimer);
+      observer.disconnect();
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, []);
+
+  return <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 z-30 h-full w-full" aria-hidden="true"/>;
 }
 
 export default function PartyApp() {
@@ -54,7 +139,6 @@ export default function PartyApp() {
   const [partyMode, setPartyMode] = useState(false);
   const [partyQrOpen, setPartyQrOpen] = useState(false);
   const [leaderCelebration, setLeaderCelebration] = useState(false);
-  const [reactions, setReactions] = useState<ReactionEvent[]>([]);
   const [showQrCard, setShowQrCard] = useState(true);
   const triggeredFor = useRef("");
   const lastPlaybackId = useRef<string | null>(null);
@@ -65,7 +149,6 @@ export default function PartyApp() {
   const allowedRequestCurrent = useRef<string | null>(null);
   const duplicateSkipInProgress = useRef<string | null>(null);
   const previousLeaderId = useRef<number | null>(null);
-  const reactionCursor = useRef(0);
   const pendingReactions = useRef<string[]>([]);
   const reactionFlushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reactionFlushBusy = useRef(false);
@@ -92,23 +175,6 @@ export default function PartyApp() {
     const timer = setInterval(loadPlayback, 1000);
     return () => clearInterval(timer);
   }, [configured]);
-
-  useEffect(() => {
-    if (!hostMode || !partyMode) { reactionCursor.current = 0; setReactions([]); return; }
-    const loadReactions = () => void jsonFetch(`/api/reactions?since=${Date.now() - 6500}&afterId=${reactionCursor.current}`, { cache: "no-store" }).then((data) => {
-      const incoming = (data.reactions || []) as ReactionEvent[];
-      if (incoming.length === 0) return;
-      reactionCursor.current = incoming[incoming.length - 1].id;
-      setReactions((current) => [...current.filter((reaction) => reaction.createdAt > Date.now() - 5600), ...incoming].slice(-90));
-    }).catch(() => undefined);
-    loadReactions();
-    const pollTimer = setInterval(loadReactions, 300);
-    const cleanupTimer = setInterval(() => setReactions((current) => {
-      const fresh = current.filter((reaction) => reaction.createdAt > Date.now() - 5600);
-      return fresh.length === current.length ? current : fresh;
-    }), 1000);
-    return () => { clearInterval(pollTimer); clearInterval(cleanupTimer); };
-  }, [hostMode, partyMode]);
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -358,7 +424,7 @@ export default function PartyApp() {
         <div className="pointer-events-none absolute -bottom-[30vh] right-[2vw] h-[75vh] w-[75vh] animate-pulse rounded-full bg-[#64f5a4]/15 blur-[130px] [animation-delay:900ms]"/>
         <div className="pointer-events-none absolute inset-0 overflow-hidden" aria-hidden="true">{["♪","♫","♪","♬","♫","♪"].map((note, index) => <span key={index} className="absolute animate-bounce font-black text-white/[.06]" style={{ left: `${8 + index * 17}%`, top: `${16 + (index % 3) * 25}%`, fontSize: `${28 + (index % 3) * 16}px`, animationDuration: `${3.8 + index * .55}s`, animationDelay: `${index * .45}s` }}>{note}</span>)}</div>
         {leaderCelebration && topTrack && <div className="pointer-events-none absolute left-1/2 top-20 z-20 -translate-x-1/2 animate-bounce rounded-full border border-[#64f5a4]/30 bg-[#0a1710]/95 px-6 py-3 text-center shadow-[0_0_60px_rgba(100,245,164,.35)] backdrop-blur-xl"><p className="text-xs font-black uppercase tracking-[.2em] text-[#64f5a4]">Nieuwe nummer 1</p><p className="mt-1 max-w-sm truncate text-lg font-black">{topTrack.name}</p></div>}
-        <div className="pointer-events-none absolute inset-0 z-30 overflow-hidden" aria-live="polite">{reactions.map((reaction) => <span key={reaction.id} className="party-reaction absolute bottom-0 grid h-16 w-16 place-items-center text-5xl" style={{ left: `${8 + (reaction.id * 37) % 82}%`, animationDelay: `-${Math.min(5, Math.max(0, (Date.now() - reaction.createdAt) / 1000))}s`, "--reaction-drift": `${(reaction.id % 2 === 0 ? 1 : -1) * (24 + (reaction.id % 4) * 12)}px` } as React.CSSProperties}>{reaction.emoji}</span>)}</div>
+        <PartyReactionLayer/>
         <div className="relative flex h-full flex-col p-5 lg:p-7">
           <header className="flex shrink-0 items-center justify-between gap-5"><div className="flex items-center gap-3"><span className="grid h-11 w-11 place-items-center rounded-2xl bg-[#64f5a4] text-[#07110d] shadow-[0_0_32px_rgba(100,245,164,.3)]"><Music2 size={23}/></span><div><p className="text-lg font-black tracking-tight">Stem de Hit</p><p className="text-xs font-bold uppercase tracking-[.22em] text-fuchsia-300">Party Mode</p></div></div><div className="flex items-center gap-2"><span className="hidden rounded-full border border-white/10 bg-white/[.05] px-3 py-2 text-sm font-bold text-zinc-300 sm:flex sm:items-center sm:gap-2"><Users size={15}/>{voterCount} {voterCount === 1 ? "stemmer" : "stemmers"}</span><Button variant="outline" onClick={() => void document.documentElement.requestFullscreen?.().catch(() => undefined)} className="rounded-xl border-white/10 bg-white/[.05] text-white hover:bg-white/10 hover:text-white"><Maximize2 size={17}/><span className="hidden sm:inline">Volledig scherm</span></Button><Button variant="outline" onClick={() => setShowHost(true)} className="rounded-xl border-white/10 bg-white/[.05] text-white hover:bg-white/10 hover:text-white"><Settings2 size={17}/><span className="hidden sm:inline">Instellingen</span></Button></div></header>
 
