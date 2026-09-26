@@ -26,7 +26,7 @@ export async function GET() {
       spotifyFetch("/me/player?additional_types=track") as Promise<SpotifyPlayback | null>,
       spotifyFetch("/me/player/queue").catch(() => null) as Promise<{ queue?: SpotifyTrack[] } | null>,
     ]);
-    const queue = (queueData?.queue || []).filter((track) => track?.uri?.startsWith("spotify:track:")).slice(0, 10).map(mapTrack);
+    const queue = (queueData?.queue || []).filter((track) => track?.uri?.startsWith("spotify:track:")).slice(0, 20).map(mapTrack);
     if (!playback?.item) return Response.json({ active: false, queue }, { headers: { "Cache-Control": "no-store" } });
     return Response.json({
       active: true,

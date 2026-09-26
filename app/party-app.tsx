@@ -56,6 +56,7 @@ export default function PartyApp() {
   const [showQrCard, setShowQrCard] = useState(true);
   const triggeredFor = useRef("");
   const lastPlaybackId = useRef<string | null>(null);
+  const lastPlaybackProgress = useRef(0);
   const autoDjBusy = useRef(false);
   const inactivePolls = useRef(0);
   const expectedPlayback = useRef<{ spotifyId: string; until: number } | null>(null);
@@ -142,6 +143,13 @@ export default function PartyApp() {
     }
     inactivePolls.current = 0;
     const currentId = playback.item.spotifyId;
+    const currentProgress = Number(playback.progressMs || 0);
+    const restartedSameTrack = lastPlaybackId.current === currentId && lastPlaybackProgress.current > 30_000 && currentProgress < 10_000;
+    if (restartedSameTrack) {
+      allowedRequestCurrent.current = null;
+      duplicateSkipInProgress.current = null;
+    }
+    lastPlaybackProgress.current = currentProgress;
     if (lastPlaybackId.current !== currentId) {
       if (allowedRequestCurrent.current && allowedRequestCurrent.current !== currentId) allowedRequestCurrent.current = null;
       if (duplicateSkipInProgress.current && duplicateSkipInProgress.current !== currentId) duplicateSkipInProgress.current = null;
