@@ -14,6 +14,13 @@ type Playback = { active: boolean; isPlaying?: boolean; progressMs?: number; ite
 type ReactionEvent = { id: number; emoji: string; createdAt: number };
 type ReactionParticle = ReactionEvent & { x: number; drift: number; rotation: number };
 
+const PARTY_THEMES = [
+  { name: "Neon Jungle", primary: "#64f5a4", secondary: "#d946ef", background: "radial-gradient(circle at 12% 5%, rgba(217,70,239,.2), transparent 38%), radial-gradient(circle at 88% 92%, rgba(100,245,164,.17), transparent 42%), #050806" },
+  { name: "Electric Sunset", primary: "#fb7185", secondary: "#fbbf24", background: "radial-gradient(circle at 14% 8%, rgba(251,113,133,.22), transparent 38%), radial-gradient(circle at 88% 90%, rgba(251,191,36,.16), transparent 42%), #0b0608" },
+  { name: "Midnight Wave", primary: "#38bdf8", secondary: "#818cf8", background: "radial-gradient(circle at 10% 8%, rgba(129,140,248,.24), transparent 38%), radial-gradient(circle at 90% 92%, rgba(56,189,248,.17), transparent 44%), #04070d" },
+  { name: "Laser Lime", primary: "#bef264", secondary: "#22d3ee", background: "radial-gradient(circle at 12% 7%, rgba(34,211,238,.2), transparent 38%), radial-gradient(circle at 86% 90%, rgba(190,242,100,.16), transparent 44%), #050905" },
+];
+
 const getVoterId = () => {
   let value = localStorage.getItem("stem-de-hit-voter");
   if (!value) { value = crypto.randomUUID(); localStorage.setItem("stem-de-hit-voter", value); }
@@ -118,6 +125,59 @@ function PartyReactionLayer() {
   return <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 z-30 h-full w-full" aria-hidden="true"/>;
 }
 
+function PartyConfettiLayer({ burst }: { burst: number }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    if (burst === 0) return;
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context) return;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = Math.max(1, Math.round(rect.width));
+    canvas.height = Math.max(1, Math.round(rect.height));
+    const colors = ["#64f5a4", "#d946ef", "#38bdf8", "#fbbf24", "#fb7185", "#ffffff"];
+    const pieces = Array.from({ length: 86 }, (_, index) => ({
+      x: Math.random() * canvas.width,
+      y: -20 - Math.random() * canvas.height * .22,
+      vx: (Math.random() - .5) * 3.4,
+      vy: 2.3 + Math.random() * 3.6,
+      size: 5 + Math.random() * 8,
+      rotation: Math.random() * Math.PI,
+      spin: (Math.random() - .5) * .22,
+      color: colors[index % colors.length],
+    }));
+    const startedAt = performance.now();
+    let previous = startedAt;
+    let frame = 0;
+    const draw = (now: number) => {
+      const delta = Math.min(2, (now - previous) / 16.7);
+      previous = now;
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      const opacity = Math.max(0, Math.min(1, (2600 - (now - startedAt)) / 550));
+      for (const piece of pieces) {
+        piece.x += piece.vx * delta;
+        piece.y += piece.vy * delta;
+        piece.vy += .035 * delta;
+        piece.rotation += piece.spin * delta;
+        context.save();
+        context.globalAlpha = opacity;
+        context.translate(piece.x, piece.y);
+        context.rotate(piece.rotation);
+        context.fillStyle = piece.color;
+        context.fillRect(-piece.size / 2, -piece.size / 3, piece.size, piece.size * .62);
+        context.restore();
+      }
+      if (now - startedAt < 2600) frame = requestAnimationFrame(draw);
+      else context.clearRect(0, 0, canvas.width, canvas.height);
+    };
+    frame = requestAnimationFrame(draw);
+    return () => { cancelAnimationFrame(frame); context.clearRect(0, 0, canvas.width, canvas.height); };
+  }, [burst]);
+
+  return <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 z-[32] h-full w-full" aria-hidden="true"/>;
+}
+
 export default function PartyApp() {
   const [tracks, setTracks] = useState<Track[]>([]);
   const [voterCount, setVoterCount] = useState(0);
@@ -139,6 +199,9 @@ export default function PartyApp() {
   const [partyMode, setPartyMode] = useState(false);
   const [partyQrOpen, setPartyQrOpen] = useState(false);
   const [leaderCelebration, setLeaderCelebration] = useState(false);
+  const [confettiBurst, setConfettiBurst] = useState(0);
+  const [partyThemeIndex, setPartyThemeIndex] = useState(0);
+  const [transitionTrack, setTransitionTrack] = useState<SearchTrack | null>(null);
   const [showQrCard, setShowQrCard] = useState(true);
   const triggeredFor = useRef("");
   const lastPlaybackId = useRef<string | null>(null);
@@ -149,6 +212,8 @@ export default function PartyApp() {
   const allowedRequestCurrent = useRef<string | null>(null);
   const duplicateSkipInProgress = useRef<string | null>(null);
   const previousLeaderId = useRef<number | null>(null);
+  const previousPartyPlaybackId = useRef<string | null>(null);
+  const milestoneVotes = useRef(new Map<number, number>());
   const pendingReactions = useRef<string[]>([]);
   const reactionFlushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reactionFlushBusy = useRef(false);
@@ -203,17 +268,64 @@ export default function PartyApp() {
     seenQueueIds.add(track.spotifyId);
     return true;
   });
+  const partyTheme = PARTY_THEMES[partyThemeIndex];
+  const newestCandidate = candidateTracks[candidateTracks.length - 1];
+  const remainingSeconds = playback.item && playback.isPlaying ? Math.max(0, Math.ceil((playback.item.durationMs - Number(playback.progressMs || 0)) / 1000)) : null;
+  const tickerItems = [
+    topTrack ? `🔥 Nu populair: ${topTrack.name} · ${topTrack.votes} ${topTrack.votes === 1 ? "stem" : "stemmen"}` : "🎵 Voeg een nummer toe en bepaal wat hierna komt",
+    newestCandidate ? `✨ Nieuw verzoek: ${newestCandidate.name} — ${newestCandidate.artist}` : "📱 Scan de QR-code om mee te doen",
+    topTrack && topTrack.votes >= 10 ? `🎉 Stemmijlpaal: ${topTrack.votes} stemmen op ${topTrack.name}` : `🙌 ${voterCount} ${voterCount === 1 ? "stemmer doet" : "stemmers doen"} mee`,
+    `🎨 Thema: ${partyTheme.name}`,
+  ];
 
   useEffect(() => {
     if (!partyMode || !topTrack) { previousLeaderId.current = topTrack?.id || null; setLeaderCelebration(false); return; }
     if (previousLeaderId.current !== null && previousLeaderId.current !== topTrack.id) {
       setLeaderCelebration(true);
+      setConfettiBurst((current) => current + 1);
       const timer = setTimeout(() => setLeaderCelebration(false), 4200);
       previousLeaderId.current = topTrack.id;
       return () => clearTimeout(timer);
     }
     previousLeaderId.current = topTrack.id;
   }, [partyMode, topTrack?.id]);
+
+  useEffect(() => {
+    if (!partyMode || !topTrack) return;
+    const previousVotes = milestoneVotes.current.get(topTrack.id);
+    if (previousVotes !== undefined && topTrack.votes >= 10 && Math.floor(previousVotes / 10) < Math.floor(topTrack.votes / 10)) setConfettiBurst((current) => current + 1);
+    milestoneVotes.current.set(topTrack.id, topTrack.votes);
+  }, [partyMode, topTrack?.id, topTrack?.votes]);
+
+  useEffect(() => {
+    const currentId = playback.item?.spotifyId || null;
+    if (!partyMode || !currentId) { previousPartyPlaybackId.current = currentId; setTransitionTrack(null); return; }
+    if (previousPartyPlaybackId.current && previousPartyPlaybackId.current !== currentId && playback.item) {
+      setTransitionTrack(playback.item);
+      const timer = setTimeout(() => setTransitionTrack(null), 2600);
+      previousPartyPlaybackId.current = currentId;
+      return () => clearTimeout(timer);
+    }
+    previousPartyPlaybackId.current = currentId;
+  }, [partyMode, playback.item?.spotifyId]);
+
+  useEffect(() => {
+    if (!hostMode || !partyMode) return;
+    const timer = setInterval(() => setPartyThemeIndex((current) => (current + 1) % PARTY_THEMES.length), 45_000);
+    return () => clearInterval(timer);
+  }, [hostMode, partyMode]);
+
+  useEffect(() => {
+    if (!hostMode || !partyMode) return;
+    let closeTimer: ReturnType<typeof setTimeout> | null = null;
+    const showAutomaticQr = () => {
+      setPartyQrOpen(true);
+      if (closeTimer) clearTimeout(closeTimer);
+      closeTimer = setTimeout(() => setPartyQrOpen(false), 30_000);
+    };
+    const timer = setInterval(showAutomaticQr, 5 * 60_000);
+    return () => { clearInterval(timer); if (closeTimer) clearTimeout(closeTimer); };
+  }, [hostMode, partyMode]);
 
   useEffect(() => {
     if (!hostMode || !topTrack) { setShowQrCard(true); return; }
@@ -419,17 +531,20 @@ export default function PartyApp() {
         </aside>
       </section>
 
-      {hostMode && partyMode && <section className="fixed inset-0 z-40 overflow-hidden bg-[#050806] text-white">
-        <div className="pointer-events-none absolute -left-[12vw] -top-[24vh] h-[70vh] w-[70vh] animate-pulse rounded-full bg-fuchsia-600/20 blur-[120px]"/>
-        <div className="pointer-events-none absolute -bottom-[30vh] right-[2vw] h-[75vh] w-[75vh] animate-pulse rounded-full bg-[#64f5a4]/15 blur-[130px] [animation-delay:900ms]"/>
+      {hostMode && partyMode && <section className="fixed inset-0 z-40 overflow-hidden text-white transition-[background] duration-[2000ms]" style={{ background: partyTheme.background }}>
+        <div className="pointer-events-none absolute -left-[12vw] -top-[24vh] h-[70vh] w-[70vh] animate-pulse rounded-full opacity-20 blur-[120px] transition-colors duration-[2000ms]" style={{ backgroundColor: partyTheme.secondary }}/>
+        <div className="pointer-events-none absolute -bottom-[30vh] right-[2vw] h-[75vh] w-[75vh] animate-pulse rounded-full opacity-15 blur-[130px] transition-colors duration-[2000ms] [animation-delay:900ms]" style={{ backgroundColor: partyTheme.primary }}/>
         <div className="pointer-events-none absolute inset-0 overflow-hidden" aria-hidden="true">{["♪","♫","♪","♬","♫","♪"].map((note, index) => <span key={index} className="absolute animate-bounce font-black text-white/[.06]" style={{ left: `${8 + index * 17}%`, top: `${16 + (index % 3) * 25}%`, fontSize: `${28 + (index % 3) * 16}px`, animationDuration: `${3.8 + index * .55}s`, animationDelay: `${index * .45}s` }}>{note}</span>)}</div>
-        {leaderCelebration && topTrack && <div className="pointer-events-none absolute left-1/2 top-20 z-20 -translate-x-1/2 animate-bounce rounded-full border border-[#64f5a4]/30 bg-[#0a1710]/95 px-6 py-3 text-center shadow-[0_0_60px_rgba(100,245,164,.35)] backdrop-blur-xl"><p className="text-xs font-black uppercase tracking-[.2em] text-[#64f5a4]">Nieuwe nummer 1</p><p className="mt-1 max-w-sm truncate text-lg font-black">{topTrack.name}</p></div>}
+        {leaderCelebration && topTrack && <div className="pointer-events-none absolute left-1/2 top-20 z-[34] -translate-x-1/2 animate-bounce rounded-full border border-white/15 bg-black/75 px-6 py-3 text-center shadow-[0_0_60px_rgba(255,255,255,.2)] backdrop-blur-xl"><p className="text-xs font-black uppercase tracking-[.2em]" style={{ color: partyTheme.primary }}>Nieuwe nummer 1</p><p className="mt-1 max-w-sm truncate text-lg font-black">{topTrack.name}</p></div>}
         <PartyReactionLayer/>
-        <div className="relative flex h-full flex-col p-5 lg:p-7">
-          <header className="flex shrink-0 items-center justify-between gap-5"><div className="flex items-center gap-3"><span className="grid h-11 w-11 place-items-center rounded-2xl bg-[#64f5a4] text-[#07110d] shadow-[0_0_32px_rgba(100,245,164,.3)]"><Music2 size={23}/></span><div><p className="text-lg font-black tracking-tight">Stem de Hit</p><p className="text-xs font-bold uppercase tracking-[.22em] text-fuchsia-300">Party Mode</p></div></div><div className="flex items-center gap-2"><span className="hidden rounded-full border border-white/10 bg-white/[.05] px-3 py-2 text-sm font-bold text-zinc-300 sm:flex sm:items-center sm:gap-2"><Users size={15}/>{voterCount} {voterCount === 1 ? "stemmer" : "stemmers"}</span><Button variant="outline" onClick={() => void document.documentElement.requestFullscreen?.().catch(() => undefined)} className="rounded-xl border-white/10 bg-white/[.05] text-white hover:bg-white/10 hover:text-white"><Maximize2 size={17}/><span className="hidden sm:inline">Volledig scherm</span></Button><Button variant="outline" onClick={() => setShowHost(true)} className="rounded-xl border-white/10 bg-white/[.05] text-white hover:bg-white/10 hover:text-white"><Settings2 size={17}/><span className="hidden sm:inline">Instellingen</span></Button></div></header>
+        <PartyConfettiLayer burst={confettiBurst}/>
+        {transitionTrack && <div className="party-track-transition pointer-events-none absolute inset-0 z-[36] grid place-items-center bg-black/80 p-8 text-center backdrop-blur-xl"><div className="max-w-3xl">{transitionTrack.imageUrl && <img src={transitionTrack.imageUrl} alt="" className="mx-auto mb-6 h-40 w-40 rounded-[28px] object-cover shadow-2xl"/>}<p className="text-sm font-black uppercase tracking-[.28em]" style={{ color: partyTheme.primary }}>Nu begint</p><h2 className="mt-3 line-clamp-2 text-5xl font-black tracking-[-.05em] lg:text-7xl">{transitionTrack.name}</h2><p className="mt-3 text-2xl font-semibold text-zinc-400">{transitionTrack.artist}</p></div></div>}
+        <div className="relative flex h-full flex-col px-5 pb-16 pt-5 lg:px-7 lg:pb-[4.5rem] lg:pt-7">
+          <header className="flex shrink-0 items-center justify-between gap-5"><div className="flex items-center gap-3"><span className="grid h-11 w-11 place-items-center rounded-2xl text-[#07110d] transition-colors duration-[2000ms]" style={{ backgroundColor: partyTheme.primary, boxShadow: `0 0 32px ${partyTheme.primary}55` }}><Music2 size={23}/></span><div><p className="text-lg font-black tracking-tight">Stem de Hit</p><p className="text-xs font-bold uppercase tracking-[.22em] transition-colors duration-[2000ms]" style={{ color: partyTheme.secondary }}>Party Mode</p></div></div><div className="flex items-center gap-2"><span className="hidden rounded-full border border-white/10 bg-white/[.05] px-3 py-2 text-sm font-bold text-zinc-300 sm:flex sm:items-center sm:gap-2"><Users size={15}/>{voterCount} {voterCount === 1 ? "stemmer" : "stemmers"}</span><Button variant="outline" onClick={() => void document.documentElement.requestFullscreen?.().catch(() => undefined)} className="rounded-xl border-white/10 bg-white/[.05] text-white hover:bg-white/10 hover:text-white"><Maximize2 size={17}/><span className="hidden sm:inline">Volledig scherm</span></Button><Button variant="outline" onClick={() => setShowHost(true)} className="rounded-xl border-white/10 bg-white/[.05] text-white hover:bg-white/10 hover:text-white"><Settings2 size={17}/><span className="hidden sm:inline">Instellingen</span></Button></div></header>
 
           <div className="mt-5 grid min-h-0 flex-1 gap-5 lg:grid-cols-[minmax(0,1.5fr)_minmax(310px,.72fr)]">
             <div className="relative flex min-h-0 overflow-hidden rounded-[32px] border border-white/10 bg-white/[.045] p-6 shadow-[0_30px_100px_rgba(0,0,0,.5)]">
+              {remainingSeconds !== null && remainingSeconds > 0 && remainingSeconds <= 15 && <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center bg-black/55 backdrop-blur-sm"><div className="text-center"><p className="text-sm font-black uppercase tracking-[.28em]" style={{ color: partyTheme.primary }}>Volgende nummer over</p><span key={remainingSeconds} className="party-countdown-number mt-2 block text-[clamp(7rem,22vw,14rem)] font-black leading-none tracking-[-.08em]">{remainingSeconds}</span></div></div>}
               {playback.active && playback.item ? <div className="grid min-h-0 w-full items-center gap-7 lg:grid-cols-[minmax(260px,.9fr)_minmax(0,1.1fr)]"><div className="grid min-h-0 place-items-center">{playback.item.imageUrl ? <img src={playback.item.imageUrl} alt="Albumhoes" className="aspect-square max-h-[62vh] w-full max-w-[min(58vh,34rem)] rounded-[28px] object-contain shadow-[0_32px_90px_rgba(0,0,0,.65)]"/> : <span className="grid aspect-square w-full max-w-[min(58vh,34rem)] place-items-center rounded-[28px] bg-white/10"><Music2 size={70}/></span>}</div><div className="min-w-0"><span className="mb-5 inline-flex items-center gap-2 rounded-full bg-[#64f5a4] px-4 py-2 text-xs font-black uppercase tracking-[.16em] text-[#07110d]"><Volume2 size={15}/>Nu speelt</span><h1 className="line-clamp-2 text-5xl font-black leading-[.92] tracking-[-.055em] xl:text-7xl">{playback.item.name}</h1><p className="mt-4 truncate text-2xl font-semibold text-zinc-400 xl:text-3xl">{playback.item.artist}</p><div className="mt-8"><div className="mb-2 flex justify-between text-sm font-bold text-zinc-500"><span>{formatDuration(playback.progressMs || 0)}</span><span>{formatDuration(playback.item.durationMs)}</span></div><div className="h-2.5 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-fuchsia-400 to-[#64f5a4] transition-all duration-700" style={{ width: `${Math.min(100, Math.max(0, ((playback.progressMs || 0) / Math.max(1, playback.item.durationMs)) * 100))}%` }}/></div></div><div className="mt-7 flex h-12 items-end gap-2" aria-hidden="true">{[42,72,54,92,64,38,80,58,96,48,70,40].map((height, index) => <span key={index} className="w-2 animate-pulse rounded-full bg-gradient-to-t from-fuchsia-500 to-[#64f5a4]" style={{ height: `${height}%`, animationDelay: `${index * 90}ms` }}/>)}</div></div></div> : <div className="m-auto text-center"><span className="mx-auto grid h-24 w-24 place-items-center rounded-[30px] bg-white/[.06] text-zinc-600"><Headphones size={48}/></span><h1 className="mt-6 text-4xl font-black">Start Spotify op de laptop</h1><p className="mt-2 text-lg text-zinc-500">Party Mode springt vanzelf aan zodra de muziek speelt.</p></div>}
             </div>
 
@@ -437,6 +552,7 @@ export default function PartyApp() {
               <button onClick={() => setPartyQrOpen(true)} className="flex shrink-0 items-center gap-4 rounded-[24px] border border-[#64f5a4]/20 bg-[#64f5a4]/10 p-4 text-left transition hover:bg-[#64f5a4]/15"><div className="grid h-20 w-20 shrink-0 place-items-center overflow-hidden rounded-xl bg-white p-1.5">{shareUrl ? <img src={`https://quickchart.io/qr?text=${encodeURIComponent(shareUrl)}&size=160&margin=1`} alt="QR-code" className="h-full w-full"/> : <QrCode className="text-[#07110d]"/>}</div><div className="min-w-0 flex-1"><p className="font-black text-[#baffd4]">Nog iemand laten stemmen?</p><p className="mt-1 text-sm text-[#79ba96]">Klik om de QR-code groot te tonen</p></div><QrCode className="shrink-0 text-[#64f5a4]"/></button></aside>
           </div>
         </div>
+        <div className="absolute inset-x-0 bottom-0 z-[35] h-12 overflow-hidden border-t border-white/10 bg-black/65 backdrop-blur-xl"><div className="party-ticker-track flex h-full items-center">{[...tickerItems, ...tickerItems].map((item, index) => <span key={`${item}-${index}`} className="flex shrink-0 items-center gap-6 px-7 text-sm font-black tracking-wide text-white/90"><span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: partyTheme.primary }}/>{item}</span>)}</div></div>
       </section>}
 
       {hostMode && partyMode && partyQrOpen && <div className="fixed inset-0 z-[45] grid place-items-center bg-black/85 p-6 backdrop-blur-xl" onClick={() => setPartyQrOpen(false)}><div className="w-full max-w-md rounded-[32px] border border-white/10 bg-[#101914] p-7 text-center shadow-2xl" onClick={(event) => event.stopPropagation()}><div className="mb-5 flex items-center justify-between"><div className="text-left"><p className="text-xs font-black uppercase tracking-[.18em] text-[#64f5a4]">Scan & stem</p><h2 className="mt-1 text-2xl font-black">Doe mee met de muziek</h2></div><button onClick={() => setPartyQrOpen(false)} aria-label="Sluiten" className="grid h-10 w-10 place-items-center rounded-full bg-white/10"><X/></button></div><div className="mx-auto aspect-square w-full rounded-[24px] bg-white p-5">{shareUrl ? <img src={`https://quickchart.io/qr?text=${encodeURIComponent(shareUrl)}&size=520&margin=1`} alt="QR-code naar de verzoeklijst" className="h-full w-full"/> : <Loader2 className="m-auto animate-spin text-[#07110d]"/>}</div><p className="mt-5 text-lg font-black text-[#64f5a4]">{voterCount} {voterCount === 1 ? "stemmer doet" : "stemmers doen"} al mee</p></div></div>}

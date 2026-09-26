@@ -23,3 +23,26 @@
 html { background: #07110d; }
 body { margin: 0; background: var(--background); color: var(--foreground); font-family: var(--font-sans); }
 button, a, input { -webkit-tap-highlight-color: transparent; }
+
+@keyframes party-countdown-pop {
+  0% { opacity: .25; transform: scale(.72); }
+  45% { opacity: 1; transform: scale(1.08); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes party-track-transition {
+  0% { opacity: 0; transform: scale(1.08); }
+  16%, 74% { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(.96); }
+}
+@keyframes party-ticker-scroll {
+  from { transform: translate3d(0,0,0); }
+  to { transform: translate3d(-50%,0,0); }
+}
+.party-countdown-number { animation: party-countdown-pop .72s cubic-bezier(.2,.8,.2,1) both; text-shadow: 0 18px 70px rgba(0,0,0,.55); }
+.party-track-transition { animation: party-track-transition 2.6s ease-in-out both; }
+.party-ticker-track { width: max-content; animation: party-ticker-scroll 34s linear infinite; will-change: transform; }
+
+@media (prefers-reduced-motion: reduce) {
+  .party-countdown-number, .party-track-transition { animation-duration: .01ms; }
+  .party-ticker-track { animation-duration: 70s; }
+}
