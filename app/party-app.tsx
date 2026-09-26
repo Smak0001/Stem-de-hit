@@ -68,14 +68,14 @@ export default function PartyApp() {
     setAdminCode(localStorage.getItem("stem-de-hit-admin") || "");
     setAutoDj(localStorage.getItem("stem-de-hit-auto-dj") !== "false");
     void refresh().catch((error) => setNotice(error.message));
-    const timer = setInterval(() => void refresh().catch(() => undefined), 5000);
+    const timer = setInterval(() => void refresh().catch(() => undefined), 1000);
     return () => clearInterval(timer);
   }, [refresh]);
 
   useEffect(() => {
     const loadPlayback = () => void jsonFetch("/api/playback", { cache: "no-store" }).then(setPlayback).catch(() => setPlayback({ active: false }));
     loadPlayback();
-    const timer = setInterval(loadPlayback, 2000);
+    const timer = setInterval(loadPlayback, 1000);
     return () => clearInterval(timer);
   }, [configured]);
 
