@@ -55,7 +55,6 @@ export default function PartyApp() {
   const [partyQrOpen, setPartyQrOpen] = useState(false);
   const [leaderCelebration, setLeaderCelebration] = useState(false);
   const [reactions, setReactions] = useState<ReactionEvent[]>([]);
-  const [reactionCooldown, setReactionCooldown] = useState(false);
   const [showQrCard, setShowQrCard] = useState(true);
   const triggeredFor = useRef("");
   const lastPlaybackId = useRef<string | null>(null);
@@ -66,6 +65,10 @@ export default function PartyApp() {
   const allowedRequestCurrent = useRef<string | null>(null);
   const duplicateSkipInProgress = useRef<string | null>(null);
   const previousLeaderId = useRef<number | null>(null);
+  const reactionCursor = useRef(0);
+  const pendingReactions = useRef<string[]>([]);
+  const reactionFlushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reactionFlushBusy = useRef(false);
 
   const refresh = useCallback(async () => {
     const data = await jsonFetch(`/api/state?voterId=${encodeURIComponent(getVoterId())}`);
@@ -91,11 +94,20 @@ export default function PartyApp() {
   }, [configured]);
 
   useEffect(() => {
-    if (!hostMode || !partyMode) { setReactions([]); return; }
-    const loadReactions = () => void jsonFetch(`/api/reactions?since=${Date.now() - 6500}`, { cache: "no-store" }).then((data) => setReactions(data.reactions || [])).catch(() => undefined);
+    if (!hostMode || !partyMode) { reactionCursor.current = 0; setReactions([]); return; }
+    const loadReactions = () => void jsonFetch(`/api/reactions?since=${Date.now() - 6500}&afterId=${reactionCursor.current}`, { cache: "no-store" }).then((data) => {
+      const incoming = (data.reactions || []) as ReactionEvent[];
+      if (incoming.length === 0) return;
+      reactionCursor.current = incoming[incoming.length - 1].id;
+      setReactions((current) => [...current.filter((reaction) => reaction.createdAt > Date.now() - 5600), ...incoming].slice(-90));
+    }).catch(() => undefined);
     loadReactions();
-    const timer = setInterval(loadReactions, 800);
-    return () => clearInterval(timer);
+    const pollTimer = setInterval(loadReactions, 300);
+    const cleanupTimer = setInterval(() => setReactions((current) => {
+      const fresh = current.filter((reaction) => reaction.createdAt > Date.now() - 5600);
+      return fresh.length === current.length ? current : fresh;
+    }), 1000);
+    return () => { clearInterval(pollTimer); clearInterval(cleanupTimer); };
   }, [hostMode, partyMode]);
 
   useEffect(() => {
@@ -218,12 +230,22 @@ export default function PartyApp() {
     finally { setBusyId(null); }
   }
 
-  async function sendReaction(emoji: string) {
-    if (reactionCooldown) return;
-    setReactionCooldown(true);
-    try { await jsonFetch("/api/reactions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ emoji, voterId: getVoterId() }) }); }
-    catch (error) { setNotice(error instanceof Error ? error.message : "Reactie versturen lukte niet."); }
-    finally { setTimeout(() => setReactionCooldown(false), 950); }
+  function sendReaction(emoji: string) {
+    pendingReactions.current.push(emoji);
+    if (reactionFlushTimer.current || reactionFlushBusy.current) return;
+    reactionFlushTimer.current = setTimeout(() => { reactionFlushTimer.current = null; void flushReactionQueue(); }, 80);
+  }
+
+  async function flushReactionQueue() {
+    if (reactionFlushBusy.current || pendingReactions.current.length === 0) return;
+    reactionFlushBusy.current = true;
+    const emojis = pendingReactions.current.splice(0, 50);
+    try { await jsonFetch("/api/reactions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ emojis, voterId: getVoterId() }) }); }
+    catch (error) { setNotice(error instanceof Error ? error.message : "Reacties versturen lukte niet."); }
+    finally {
+      reactionFlushBusy.current = false;
+      if (pendingReactions.current.length > 0 && !reactionFlushTimer.current) reactionFlushTimer.current = setTimeout(() => { reactionFlushTimer.current = null; void flushReactionQueue(); }, 50);
+    }
   }
 
   async function beginSpotifyLogin() {
@@ -305,7 +327,7 @@ export default function PartyApp() {
           {!hostMode && <div className="mb-5 max-w-2xl sm:mb-7"><p className="mb-2 flex items-center gap-2 text-xs font-bold uppercase tracking-[.16em] text-[#64f5a4] sm:mb-3 sm:text-sm sm:tracking-[.18em]"><PartyPopper size={16}/> Jij bepaalt wat hierna komt</p><h1 className="text-[2.35rem] font-black leading-[.96] tracking-[-.055em] sm:text-6xl">Zoek. Stem.<br/><span className="text-zinc-500">Zet de avond aan.</span></h1></div>}
           {!hostMode && playback.active && playback.item && <div className="mb-4 flex items-center gap-3 rounded-2xl border border-[#64f5a4]/20 bg-[#0d1d15] p-3 shadow-xl lg:hidden">{playback.item.imageUrl ? <img src={playback.item.imageUrl} alt="Albumhoes" className="h-14 w-14 shrink-0 rounded-xl object-cover"/> : <span className="grid h-14 w-14 shrink-0 place-items-center rounded-xl bg-white/10"><Music2/></span>}<div className="min-w-0 flex-1"><div className="mb-1 flex items-center justify-between gap-2"><span className="flex items-center gap-1.5 text-[11px] font-black uppercase tracking-wider text-[#64f5a4]"><Volume2 size={12}/>Nu speelt</span><span className="text-[11px] text-zinc-600">{formatDuration(playback.progressMs || 0)} / {formatDuration(playback.item.durationMs)}</span></div><h2 className="truncate font-black">{playback.item.name}</h2><p className="truncate text-sm text-zinc-500">{playback.item.artist}</p><div className="mt-2 h-1 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-[#64f5a4] transition-all" style={{ width: `${Math.min(100, Math.max(0, ((playback.progressMs || 0) / Math.max(1, playback.item.durationMs)) * 100))}%` }}/></div></div></div>}
           {hostMode && <div className="relative mb-3 overflow-hidden rounded-2xl border border-[#64f5a4]/20 bg-[linear-gradient(110deg,rgba(100,245,164,.12),rgba(255,255,255,.025))] px-5 py-3"><div className="absolute -right-8 -top-16 h-40 w-40 rounded-full bg-[#64f5a4]/10 blur-3xl"/><div className="relative flex items-end justify-between gap-5"><div><p className="mb-1 flex items-center gap-2 text-xs font-black uppercase tracking-[.18em] text-[#64f5a4]"><PartyPopper size={14}/>Jij bepaalt wat hierna komt</p><h1 className="text-2xl font-black leading-none tracking-[-.04em] sm:text-3xl">Zoek. Stem. <span className="text-zinc-500">Zet de avond aan.</span></h1></div><div className="hidden shrink-0 items-end gap-1.5 sm:flex" aria-hidden="true"><span className="h-3 w-1.5 animate-pulse rounded-full bg-[#64f5a4]/35"/><span className="h-7 w-1.5 animate-pulse rounded-full bg-[#64f5a4]/55 [animation-delay:150ms]"/><span className="h-5 w-1.5 animate-pulse rounded-full bg-[#64f5a4]/75 [animation-delay:300ms]"/><span className="h-9 w-1.5 animate-pulse rounded-full bg-[#64f5a4] [animation-delay:450ms]"/><span className="h-4 w-1.5 animate-pulse rounded-full bg-[#64f5a4]/60 [animation-delay:600ms]"/></div></div></div>}
-          {!hostMode && <div className="mb-4 flex items-center justify-between gap-3 rounded-2xl border border-fuchsia-400/15 bg-fuchsia-400/[.06] p-2.5 sm:p-3"><div className="pl-1"><p className="text-sm font-black text-fuchsia-100">Reageer live</p><p className="hidden text-xs text-zinc-500 sm:block">Verschijnt in Party Mode</p></div><div className="flex gap-1.5">{["🔥", "❤️", "🎉", "🙌"].map((emoji) => <button key={emoji} onClick={() => void sendReaction(emoji)} disabled={reactionCooldown} aria-label={`Stuur ${emoji}`} className="grid h-11 w-11 place-items-center rounded-xl border border-white/10 bg-white/[.06] text-xl transition hover:-translate-y-1 hover:border-fuchsia-300/40 hover:bg-fuchsia-300/10 active:scale-90 disabled:opacity-50 sm:h-12 sm:w-12 sm:text-2xl">{emoji}</button>)}</div></div>}
+          {!hostMode && <div className="mb-4 flex items-center justify-between gap-3 rounded-2xl border border-fuchsia-400/15 bg-fuchsia-400/[.06] p-2.5 sm:p-3"><div className="pl-1"><p className="text-sm font-black text-fuchsia-100">Reageer live</p><p className="hidden text-xs text-zinc-500 sm:block">Verschijnt in Party Mode</p></div><div className="flex gap-1.5">{["🔥", "❤️", "🎉", "🙌"].map((emoji) => <button key={emoji} onClick={() => sendReaction(emoji)} aria-label={`Stuur ${emoji}`} className="grid h-11 w-11 touch-manipulation place-items-center rounded-xl border border-white/10 bg-white/[.06] text-xl transition hover:-translate-y-1 hover:border-fuchsia-300/40 hover:bg-fuchsia-300/10 active:scale-90 sm:h-12 sm:w-12 sm:text-2xl">{emoji}</button>)}</div></div>}
           <div className="relative z-30">
             <form onSubmit={search} className="relative mb-2"><Search className="absolute left-5 top-1/2 -translate-y-1/2 text-zinc-500" size={hostMode ? 19 : 22}/><Input value={query} onChange={(e) => setQuery(e.target.value)} placeholder={configured ? "Zoek een nummer of artiest" : "Spotify wordt zo gekoppeld door de host"} disabled={!configured} className={`${hostMode ? "h-12" : "h-16"} rounded-2xl border-white/10 bg-white/[.07] pl-14 pr-28 text-base text-white placeholder:text-zinc-500 focus-visible:border-[#64f5a4]/70 focus-visible:ring-[#64f5a4]/20`}/><Button type="submit" disabled={searching || !configured} className={`absolute right-2 rounded-xl bg-[#64f5a4] px-5 font-bold text-[#06100b] hover:bg-[#8affba] ${hostMode ? "top-1.5 h-9" : "top-2 h-12"}`}>{searching ? <Loader2 className="animate-spin"/> : "Zoeken"}</Button></form>
             {results.length > 0 && <div className={`${hostMode ? "absolute left-0 right-0 top-14 max-h-[55vh] overflow-y-auto" : "mb-8"} overflow-hidden rounded-2xl border border-white/10 bg-[#111d17] shadow-2xl`}><div className="flex items-center justify-between border-b border-white/10 px-5 py-3 text-sm text-zinc-400"><span>Spotify-resultaten</span><button onClick={() => setResults([])} aria-label="Sluiten"><X size={18}/></button></div>{results.map((track) => <button key={track.spotifyId} onClick={() => add(track)} disabled={busyId === -1} className="flex w-full items-center gap-3 border-b border-white/[.06] p-3 text-left last:border-0 hover:bg-white/[.06]">{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-12 w-12 rounded-lg object-cover"/> : <span className="grid h-12 w-12 place-items-center rounded-lg bg-white/10"><Music2/></span>}<span className="min-w-0 flex-1"><strong className="block truncate text-[15px]">{track.name}</strong><span className="block truncate text-sm text-zinc-400">{track.artist}</span></span><span className="text-xs text-zinc-500">{formatDuration(track.durationMs)}</span><span className="grid h-9 w-9 place-items-center rounded-full bg-[#64f5a4] text-xl font-bold text-[#07110d]">+</span></button>)}</div>}
