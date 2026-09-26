@@ -1,8 +1,7 @@
 "use client";
-/* eslint-disable @next/next/no-img-element -- Spotify artwork and generated QR images are dynamic remote assets. */
+/* eslint-disable @next/next/no-img-element, @next/next/no-html-link-for-pages -- Spotify artwork is remote; vinext RSC prefetch currently requires a plain home link. */
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import Link from "next/link";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Check, ChevronUp, Copy, Headphones, Loader2, LockKeyhole, Maximize2, Music2, PartyPopper, Play, QrCode, RotateCcw, Search, Settings2, Smartphone, Sparkles, Users, Volume2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -29,6 +28,8 @@ const getVoterId = () => {
   if (!value) { value = crypto.randomUUID(); localStorage.setItem("stem-de-hit-voter", value); }
   return value;
 };
+
+const subscribeToClient = () => () => undefined;
 
 // API responses are validated at their route boundary; callers consume the route-specific shape.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -184,6 +185,7 @@ function PartyConfettiLayer({ burst }: { burst: number }) {
 }
 
 export default function PartyApp() {
+  const clientReady = useSyncExternalStore(subscribeToClient, () => true, () => false);
   const [tracks, setTracks] = useState<Track[]>([]);
   const [voterCount, setVoterCount] = useState(0);
   const [query, setQuery] = useState("");
@@ -192,7 +194,7 @@ export default function PartyApp() {
   const [configured, setConfigured] = useState(false);
   const [notice, setNotice] = useState("");
   const [noticeTone, setNoticeTone] = useState<"success" | "error">("success");
-  const [hostMode] = useState(() => typeof window !== "undefined" && new URLSearchParams(window.location.search).get("host") === "1");
+  const hostMode = clientReady && new URLSearchParams(window.location.search).get("host") === "1";
   const [hostAuthenticated, setHostAuthenticated] = useState(false);
   const [showHost, setShowHost] = useState(false);
   const [adminCode, setAdminCode] = useState("");
@@ -200,10 +202,10 @@ export default function PartyApp() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [selectedDevice, setSelectedDevice] = useState("");
   const [busyId, setBusyId] = useState<number | null>(null);
-  const [shareUrl] = useState(() => typeof window === "undefined" ? "" : `${window.location.origin}/`);
+  const shareUrl = clientReady ? `${window.location.origin}/` : "";
   const [playback, setPlayback] = useState<Playback>({ active: false });
-  const [autoDj, setAutoDj] = useState(() => typeof window === "undefined" || localStorage.getItem("stem-de-hit-auto-dj") !== "false");
-  const [partyMode, setPartyMode] = useState(() => typeof window !== "undefined" && localStorage.getItem("stem-de-hit-party-mode") === "true");
+  const [autoDj, setAutoDj] = useState(true);
+  const [partyMode, setPartyMode] = useState(false);
   const [partyQrOpen, setPartyQrOpen] = useState(false);
   const [leaderCelebration, setLeaderCelebration] = useState(false);
   const [confettiBurst, setConfettiBurst] = useState(0);
@@ -234,6 +236,15 @@ export default function PartyApp() {
     const data = await jsonFetch(`/api/state?voterId=${encodeURIComponent(getVoterId())}`);
     setTracks(data.tracks); setConfigured(data.configured); setVoterCount(Number(data.voterCount || 0));
   }, []);
+
+  useEffect(() => {
+    if (!clientReady) return;
+    const timer = setTimeout(() => {
+      setAutoDj(localStorage.getItem("stem-de-hit-auto-dj") !== "false");
+      setPartyMode(localStorage.getItem("stem-de-hit-party-mode") === "true");
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [clientReady]);
 
   useEffect(() => {
     let stopped = false;
@@ -535,7 +546,7 @@ export default function PartyApp() {
   return (
     <main className={`${hostMode ? "h-[100dvh] overflow-hidden" : "min-h-screen"} bg-[radial-gradient(circle_at_75%_5%,rgba(81,255,168,.13),transparent_28%),linear-gradient(145deg,#07110d_0%,#0d1813_52%,#050907_100%)] text-white`}>
       <header className={`mx-auto flex max-w-7xl items-center justify-between px-4 sm:px-8 ${hostMode ? "h-16" : "py-4 sm:py-5"}`}>
-        <Link href="/" className="flex items-center gap-3 font-black tracking-tight"><span className="grid h-10 w-10 place-items-center rounded-2xl bg-[#64f5a4] text-[#07110d] shadow-[0_0_28px_rgba(100,245,164,.28)]"><Music2 size={21}/></span><span className="text-xl">Stem de Hit</span></Link>
+        <a href="/" className="flex items-center gap-3 font-black tracking-tight"><span className="grid h-10 w-10 place-items-center rounded-2xl bg-[#64f5a4] text-[#07110d] shadow-[0_0_28px_rgba(100,245,164,.28)]"><Music2 size={21}/></span><span className="text-xl">Stem de Hit</span></a>
         {hostMode && <div className="flex items-center gap-2"><span className={`hidden rounded-full px-3 py-1 text-xs font-black sm:block ${autoDj ? "bg-[#64f5a4]/15 text-[#64f5a4]" : "bg-white/10 text-zinc-400"}`}>Auto-DJ {autoDj ? "aan" : "uit"}</span><Button variant="ghost" className="rounded-full text-zinc-300 hover:bg-white/10 hover:text-white" onClick={() => setShowHost(true)}><Settings2 size={17}/><span className="hidden sm:inline">Hostinstellingen</span></Button></div>}
       </header>
 
