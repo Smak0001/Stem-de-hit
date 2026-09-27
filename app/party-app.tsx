@@ -242,7 +242,7 @@ export default function PartyApp() {
   const lastPlaybackId = useRef<string | null>(null);
   const autoDjBusy = useRef(false);
   const inactivePolls = useRef(0);
-  const expectedPlayback = useRef<{ spotifyId: string; itemId: number; until: number } | null>(null);
+  const expectedPlayback = useRef<{ spotifyId: string; itemId: number; until: number; normalizeOnStart: boolean } | null>(null);
   const previousLeaderId = useRef<number | null>(null);
   const previousPartyPlaybackId = useRef<string | null>(null);
   const milestoneVotes = useRef(new Map<number, number>());
@@ -470,7 +470,13 @@ export default function PartyApp() {
     inactivePolls.current = 0;
     const currentId = playback.item.spotifyId;
     if (expectedPlayback.current) {
-      if (currentId === expectedPlayback.current.spotifyId) { expectedPlayback.current = null; lastPlaybackId.current = currentId; return; }
+      if (currentId === expectedPlayback.current.spotifyId) {
+        const expected = expectedPlayback.current;
+        expectedPlayback.current = null;
+        lastPlaybackId.current = currentId;
+        if (expected.normalizeOnStart && !autoDjBusy.current) void playNext(expected.itemId, true, true, true);
+        return;
+      }
       const changedBeforeWinner = lastPlaybackId.current !== null && lastPlaybackId.current !== currentId;
       if (changedBeforeWinner && !autoDjBusy.current) {
         const expected = expectedPlayback.current;
@@ -578,7 +584,7 @@ export default function PartyApp() {
     if (automatic) autoDjBusy.current = true;
     try {
       const data = await jsonFetch("/api/host/play-next", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode, itemId, deviceId: selectedDevice || undefined, immediate, recover }) });
-      expectedPlayback.current = { spotifyId: data.spotifyId, itemId: data.itemId, until: Date.now() + (immediate ? 10_000 : 20_000) };
+      expectedPlayback.current = { spotifyId: data.spotifyId, itemId: data.itemId, until: Date.now() + (immediate ? 10_000 : 20_000), normalizeOnStart: Boolean(data.normalizeOnStart) };
       setNotice(automatic && !immediate ? `${data.name} staat klaar als volgende.` : automatic ? `${data.name} is als winnaar gestart.` : `${data.name} speelt nu op Spotify.`);
       await refresh();
       const latest = await jsonFetch(`/api/playback?adminCode=${encodeURIComponent(adminCode)}`, { cache: "no-store" }).catch(() => null);
