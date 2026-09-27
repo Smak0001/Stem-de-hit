@@ -1,3 +1,4 @@
+import { hasPartyAccess, partyAccessDenied } from "@/lib/party-access";
 import { apiError, spotifyFetch } from "@/lib/spotify";
 
 type SpotifyTrack = {
@@ -20,8 +21,10 @@ function mapTrack(track: SpotifyTrack) {
   return { spotifyId: track.id || "", uri: track.uri || "", name: track.name || "Onbekend nummer", artist: track.artists?.map((artist) => artist.name).filter(Boolean).join(", ") || "Onbekende artiest", album: track.album?.name || "", imageUrl: track.album?.images?.[0]?.url || null, durationMs: Number(track.duration_ms || 0) };
 }
 
-export async function GET() {
+export async function GET(request: Request) {
   try {
+    const adminCode = new URL(request.url).searchParams.get("adminCode");
+    if (!await hasPartyAccess(request, adminCode)) return partyAccessDenied();
     const [playback, queueData] = await Promise.all([
       spotifyFetch("/me/player?additional_types=track") as Promise<SpotifyPlayback | null>,
       spotifyFetch("/me/player/queue").catch(() => null) as Promise<{ queue?: SpotifyTrack[] } | null>,

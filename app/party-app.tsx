@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, ChevronUp, Copy, Headphones, Loader2, LockKeyhole, Maximize2, Music2, PartyPopper, Play, QrCode, RotateCcw, Search, Settings2, Smartphone, Sparkles, Users, Volume2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
 import { Switch } from "@/components/ui/switch";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
 
@@ -13,6 +14,7 @@ type Device = { id: string; name: string; type: string; is_active: boolean };
 type Playback = { active: boolean; isPlaying?: boolean; progressMs?: number; item?: SearchTrack; queue?: SearchTrack[]; device?: { id: string; name: string; type: string } | null };
 type ReactionEvent = { id: number; emoji: string; createdAt: number };
 type ReactionParticle = ReactionEvent & { x: number; drift: number; rotation: number };
+type PartyCodeInfo = { code: string; rotatesAt: number; expiresInSeconds: number };
 
 const PARTY_THEMES = [
   { name: "Neon Jungle", primary: "#64f5a4", secondary: "#d946ef", background: "radial-gradient(circle at 12% 5%, rgba(217,70,239,.2), transparent 38%), radial-gradient(circle at 88% 92%, rgba(100,245,164,.17), transparent 42%), #050806" },
@@ -41,7 +43,11 @@ function formatDuration(ms: number) {
   return `${minutes}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, "0")}`;
 }
 
-function PartyReactionLayer() {
+function formatCountdown(seconds: number) {
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function PartyReactionLayer({ adminCode }: { adminCode: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cursorRef = useRef(0);
 
@@ -102,7 +108,7 @@ function PartyReactionLayer() {
       startDrawing();
     };
 
-    const loadReactions = () => void jsonFetch(`/api/reactions?since=${Date.now() - 6500}&afterId=${cursorRef.current}`, { cache: "no-store" }).then((data) => {
+    const loadReactions = () => void jsonFetch(`/api/reactions?since=${Date.now() - 6500}&afterId=${cursorRef.current}&adminCode=${encodeURIComponent(adminCode)}`, { cache: "no-store" }).then((data) => {
       const incoming = (data.reactions || []) as ReactionEvent[];
       if (incoming.length === 0) return;
       cursorRef.current = incoming[incoming.length - 1].id;
@@ -120,7 +126,7 @@ function PartyReactionLayer() {
       observer.disconnect();
       if (frame !== null) cancelAnimationFrame(frame);
     };
-  }, []);
+  }, [adminCode]);
 
   return <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 z-30 h-full w-full" aria-hidden="true"/>;
 }
@@ -187,6 +193,12 @@ export default function PartyApp() {
   const [configured, setConfigured] = useState(false);
   const [notice, setNotice] = useState("");
   const [hostMode, setHostMode] = useState(false);
+  const [appReady, setAppReady] = useState(false);
+  const [joined, setJoined] = useState(false);
+  const [joinCode, setJoinCode] = useState("");
+  const [joinError, setJoinError] = useState("");
+  const [joining, setJoining] = useState(false);
+  const [partyAccess, setPartyAccess] = useState<PartyCodeInfo | null>(null);
   const [showHost, setShowHost] = useState(false);
   const [adminCode, setAdminCode] = useState("");
   const [clientId, setClientId] = useState("");
@@ -217,27 +229,45 @@ export default function PartyApp() {
   const reactionFlushBusy = useRef(false);
 
   const refresh = useCallback(async () => {
-    const data = await jsonFetch(`/api/state?voterId=${encodeURIComponent(getVoterId())}`);
+    const adminQuery = hostMode && adminCode ? `&adminCode=${encodeURIComponent(adminCode)}` : "";
+    const data = await jsonFetch(`/api/state?voterId=${encodeURIComponent(getVoterId())}${adminQuery}`);
     setTracks(data.tracks); setConfigured(data.configured); setVoterCount(Number(data.voterCount || 0));
-  }, []);
+  }, [adminCode, hostMode]);
 
   useEffect(() => {
-    setHostMode(new URLSearchParams(location.search).get("host") === "1");
+    const isHost = new URLSearchParams(location.search).get("host") === "1";
+    setHostMode(isHost);
     setShareUrl(`${location.origin}/`);
     setAdminCode(localStorage.getItem("stem-de-hit-admin") || "");
     setAutoDj(localStorage.getItem("stem-de-hit-auto-dj") !== "false");
     setPartyMode(localStorage.getItem("stem-de-hit-party-mode") === "true");
+    if (isHost) { setJoined(true); setAppReady(true); return; }
+    void jsonFetch("/api/join", { cache: "no-store" }).then((data) => setJoined(Boolean(data.authorized))).catch(() => setJoined(false)).finally(() => setAppReady(true));
+  }, []);
+
+  useEffect(() => {
+    if (!appReady || (!hostMode && !joined) || (hostMode && !adminCode)) return;
     void refresh().catch((error) => setNotice(error.message));
     const timer = setInterval(() => void refresh().catch(() => undefined), 1000);
     return () => clearInterval(timer);
-  }, [refresh]);
+  }, [adminCode, appReady, hostMode, joined, refresh]);
 
   useEffect(() => {
-    const loadPlayback = () => void jsonFetch("/api/playback", { cache: "no-store" }).then(setPlayback).catch(() => setPlayback({ active: false }));
+    if (!appReady || (!hostMode && !joined) || (hostMode && !adminCode)) return;
+    const adminQuery = hostMode && adminCode ? `?adminCode=${encodeURIComponent(adminCode)}` : "";
+    const loadPlayback = () => void jsonFetch(`/api/playback${adminQuery}`, { cache: "no-store" }).then(setPlayback).catch(() => setPlayback({ active: false }));
     loadPlayback();
     const timer = setInterval(loadPlayback, 1000);
     return () => clearInterval(timer);
-  }, [configured]);
+  }, [adminCode, appReady, configured, hostMode, joined]);
+
+  useEffect(() => {
+    if (!hostMode || !adminCode) { setPartyAccess(null); return; }
+    const loadCode = () => void jsonFetch(`/api/host/party-code?adminCode=${encodeURIComponent(adminCode)}`, { cache: "no-store" }).then(setPartyAccess).catch(() => setPartyAccess(null));
+    loadCode();
+    const timer = setInterval(loadCode, 1000);
+    return () => clearInterval(timer);
+  }, [adminCode, hostMode]);
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -247,6 +277,7 @@ export default function PartyApp() {
   }, [hostMode]);
 
   useEffect(() => {
+    if (!joined && !hostMode) return;
     type ModelContext = { registerTool: (tool: unknown, options?: { signal: AbortSignal }) => void };
     const context = (document as Document & { modelContext?: ModelContext }).modelContext;
     if (!context?.registerTool) return;
@@ -255,7 +286,7 @@ export default function PartyApp() {
     context.registerTool({ name: "vote_for_track", title: "Stem op nummer", description: "Breng namens deze telefoon een stem uit op een bestaand nummer.", inputSchema: { type: "object", properties: { itemId: { type: "number" } }, required: ["itemId"], additionalProperties: false }, annotations: { readOnlyHint: false, untrustedContentHint: false }, execute: async (input: unknown) => { const { itemId } = input as { itemId: number }; await vote(itemId); return { itemId, voted: true }; } }, { signal: lifecycle.signal });
     return () => lifecycle.abort();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [hostMode, joined]);
 
   const candidateTracks = tracks.filter((track) => track.status === "candidate");
   const topTrack = candidateTracks[0];
@@ -403,21 +434,21 @@ export default function PartyApp() {
   async function search(event: React.FormEvent) {
     event.preventDefault(); if (query.trim().length < 2) return;
     setSearching(true); setNotice("");
-    try { const data = await jsonFetch(`/api/search?q=${encodeURIComponent(query.trim())}`); setResults(data.tracks); }
+    try { const data = await jsonFetch(`/api/search?q=${encodeURIComponent(query.trim())}${hostMode && adminCode ? `&adminCode=${encodeURIComponent(adminCode)}` : ""}`); setResults(data.tracks); }
     catch (error) { setNotice(error instanceof Error ? error.message : "Zoeken lukte niet."); }
     finally { setSearching(false); }
   }
 
   async function add(track: SearchTrack) {
     setBusyId(-1); setNotice("");
-    try { await jsonFetch("/api/suggestions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ track, voterId: getVoterId() }) }); setResults([]); setQuery(""); setNotice(`${track.name} staat in de lijst.`); await refresh(); }
+    try { await jsonFetch("/api/suggestions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ track, voterId: getVoterId(), adminCode: hostMode ? adminCode : undefined }) }); setResults([]); setQuery(""); setNotice(`${track.name} staat in de lijst.`); await refresh(); }
     catch (error) { setNotice(error instanceof Error ? error.message : "Toevoegen lukte niet."); }
     finally { setBusyId(null); }
   }
 
   async function vote(itemId: number) {
     setBusyId(itemId); setNotice("");
-    try { await jsonFetch("/api/vote", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ itemId, voterId: getVoterId() }) }); await refresh(); }
+    try { await jsonFetch("/api/vote", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ itemId, voterId: getVoterId(), adminCode: hostMode ? adminCode : undefined }) }); await refresh(); }
     catch (error) { setNotice(error instanceof Error ? error.message : "Stemmen lukte niet."); }
     finally { setBusyId(null); }
   }
@@ -432,7 +463,7 @@ export default function PartyApp() {
     if (reactionFlushBusy.current || pendingReactions.current.length === 0) return;
     reactionFlushBusy.current = true;
     const emojis = pendingReactions.current.splice(0, 50);
-    try { await jsonFetch("/api/reactions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ emojis, voterId: getVoterId() }) }); }
+    try { await jsonFetch("/api/reactions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ emojis, voterId: getVoterId(), adminCode: hostMode ? adminCode : undefined }) }); }
     catch (error) { setNotice(error instanceof Error ? error.message : "Reacties versturen lukte niet."); }
     finally {
       reactionFlushBusy.current = false;
@@ -479,7 +510,7 @@ export default function PartyApp() {
       expectedPlayback.current = { spotifyId: data.spotifyId, itemId: data.itemId, until: Date.now() + (immediate ? 10_000 : 20_000) };
       setNotice(automatic && !immediate ? `${data.name} staat klaar als volgende.` : automatic ? `${data.name} is als winnaar gestart.` : `${data.name} speelt nu op Spotify.`);
       await refresh();
-      const latest = await jsonFetch("/api/playback", { cache: "no-store" }).catch(() => null);
+      const latest = await jsonFetch(`/api/playback?adminCode=${encodeURIComponent(adminCode)}`, { cache: "no-store" }).catch(() => null);
       if (latest?.item?.spotifyId) lastPlaybackId.current = latest.item.spotifyId;
       if (latest) setPlayback(latest);
     }
@@ -494,14 +525,49 @@ export default function PartyApp() {
     finally { setBusyId(null); }
   }
 
+  async function joinParty(event: React.FormEvent) {
+    event.preventDefault();
+    if (joinCode.length !== 6) return;
+    setJoining(true); setJoinError("");
+    try {
+      await jsonFetch("/api/join", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: joinCode }) });
+      setJoined(true); setJoinCode("");
+    } catch (error) {
+      setJoinError(error instanceof Error ? error.message : "De code klopt niet.");
+    } finally {
+      setJoining(false);
+    }
+  }
+
   const shownTracks = hostMode ? candidateTracks.slice(0, 5) : candidateTracks;
   const queueFillTracks = spotifyQueueTracks.slice(0, hostMode ? Math.max(0, 5 - shownTracks.length) : 5);
+
+  if (!appReady) return <main className="grid min-h-[100dvh] place-items-center overflow-hidden bg-[#07110d] text-[#64f5a4]"><Loader2 className="animate-spin" size={32}/></main>;
+
+  if (!hostMode && !joined) return (
+    <main className="grid min-h-[100dvh] w-full max-w-full place-items-center overflow-x-hidden bg-[radial-gradient(circle_at_50%_0%,rgba(100,245,164,.16),transparent_38%),linear-gradient(145deg,#07110d,#050907)] px-4 py-8 text-white">
+      <section className="w-full max-w-sm rounded-[28px] border border-white/10 bg-[#0e1914]/95 p-5 text-center shadow-[0_30px_100px_rgba(0,0,0,.55)] min-[360px]:p-7">
+        <span className="mx-auto grid h-14 w-14 place-items-center rounded-2xl bg-[#64f5a4] text-[#07110d] shadow-[0_0_38px_rgba(100,245,164,.3)]"><LockKeyhole size={27}/></span>
+        <p className="mt-5 text-xs font-black uppercase tracking-[.2em] text-[#64f5a4]">Alleen voor aanwezige gasten</p>
+        <h1 className="mt-2 text-3xl font-black tracking-[-.045em]">Vul de code van het scherm in</h1>
+        <p className="mx-auto mt-3 max-w-xs text-sm leading-6 text-zinc-400">De code staat bij de QR-code op de tv en wisselt automatisch.</p>
+        <form onSubmit={joinParty} className="mt-6">
+          <InputOTP autoFocus maxLength={6} pattern="^[a-zA-Z0-9]*$" value={joinCode} onChange={(value) => { setJoinCode(value.toUpperCase()); setJoinError(""); }} containerClassName="w-full justify-center" aria-label="Toegangscode">
+            <InputOTPGroup className="gap-1.5 min-[360px]:gap-2">{Array.from({ length: 6 }, (_, index) => <InputOTPSlot key={index} index={index} className="h-12 w-10 rounded-xl border border-white/10 bg-white/[.06] text-lg font-black uppercase text-white shadow-none first:rounded-xl first:border last:rounded-xl min-[360px]:h-14 min-[360px]:w-11"/>)}</InputOTPGroup>
+          </InputOTP>
+          {joinError && <p role="alert" className="mt-3 text-sm font-semibold text-red-300">{joinError}</p>}
+          <Button type="submit" disabled={joining || joinCode.length !== 6} className="mt-5 h-12 w-full rounded-xl bg-[#64f5a4] font-black text-[#07110d] hover:bg-[#8affba]">{joining ? <><Loader2 className="animate-spin"/>Controleren</> : "Meedoen"}</Button>
+        </form>
+        <p className="mt-5 text-xs text-zinc-600">Al toegelaten? Deze telefoon onthoudt dat vanzelf.</p>
+      </section>
+    </main>
+  );
 
   return (
     <main className={`${hostMode ? "h-[100dvh] overflow-hidden" : "min-h-screen w-full max-w-full overflow-x-hidden"} bg-[radial-gradient(circle_at_75%_5%,rgba(81,255,168,.13),transparent_28%),linear-gradient(145deg,#07110d_0%,#0d1813_52%,#050907_100%)] text-white`}>
       <header className={`mx-auto flex min-w-0 max-w-7xl items-center justify-between px-3 min-[360px]:px-4 sm:px-8 ${hostMode ? "h-16" : "py-4 sm:py-5"}`}>
         <a href="/" className="flex items-center gap-3 font-black tracking-tight"><span className="grid h-10 w-10 place-items-center rounded-2xl bg-[#64f5a4] text-[#07110d] shadow-[0_0_28px_rgba(100,245,164,.28)]"><Music2 size={21}/></span><span className="text-xl">Stem de Hit</span></a>
-        <div className="flex items-center gap-2">{hostMode && <span className={`hidden rounded-full px-3 py-1 text-xs font-black sm:block ${autoDj ? "bg-[#64f5a4]/15 text-[#64f5a4]" : "bg-white/10 text-zinc-500"}`}>Auto-DJ {autoDj ? "aan" : "uit"}</span>}<Button variant="ghost" className="rounded-full text-zinc-300 hover:bg-white/10 hover:text-white" onClick={() => setShowHost(!showHost)}><Settings2 size={17}/><span className="hidden sm:inline">Hostinstellingen</span></Button></div>
+        <div className="flex items-center gap-2">{hostMode && partyAccess && <span className="hidden items-center gap-2 rounded-full border border-[#64f5a4]/20 bg-[#64f5a4]/10 px-3 py-1 text-xs sm:flex"><span className="font-bold text-[#79ba96]">Code</span><strong className="font-mono tracking-[.14em] text-[#baffd4]">{partyAccess.code}</strong><span className="tabular-nums text-[#79ba96]">{formatCountdown(partyAccess.expiresInSeconds)}</span></span>}{hostMode && <span className={`hidden rounded-full px-3 py-1 text-xs font-black sm:block ${autoDj ? "bg-[#64f5a4]/15 text-[#64f5a4]" : "bg-white/10 text-zinc-500"}`}>Auto-DJ {autoDj ? "aan" : "uit"}</span>}<Button variant="ghost" className="rounded-full text-zinc-300 hover:bg-white/10 hover:text-white" onClick={() => setShowHost(!showHost)}><Settings2 size={17}/><span className="hidden sm:inline">Hostinstellingen</span></Button></div>
       </header>
 
       <section className={`mx-auto grid min-w-0 max-w-7xl gap-4 px-3 min-[360px]:px-4 sm:px-8 ${hostMode ? "h-[calc(100dvh-4rem)] min-h-0 pb-4 lg:grid-cols-[minmax(0,1fr)_minmax(300px,360px)]" : "w-full max-w-full gap-6 pb-10 pt-1 sm:pb-16 sm:pt-3 lg:grid-cols-[minmax(0,1fr)_360px] lg:pt-8"}`}>
@@ -526,7 +592,7 @@ export default function PartyApp() {
 
         <aside className={hostMode ? "flex min-h-0 flex-col gap-3" : "hidden space-y-5 lg:block lg:self-start"}>
           {hostMode && <div className="relative min-h-0 flex-1 overflow-hidden rounded-[28px] border border-[#64f5a4]/25 bg-[#0e1914] shadow-[0_24px_70px_rgba(0,0,0,.45)]">
-            <div className={`absolute inset-0 flex flex-col p-5 transition-all duration-700 ${showQrCard || !topTrack ? "translate-x-0 opacity-100" : "-translate-x-8 opacity-0 pointer-events-none"}`}><div className="flex items-center gap-3"><span className="grid h-10 w-10 place-items-center rounded-xl bg-white/10"><Smartphone size={20}/></span><div className="min-w-0 flex-1"><h3 className="font-bold">Scan & stem</h3><p className="text-xs text-zinc-500">Open de lijst op je telefoon</p></div><span className="rounded-full bg-[#64f5a4]/15 px-3 py-1 text-sm font-black text-[#64f5a4]">{voterCount} {voterCount === 1 ? "stemmer" : "stemmers"}</span></div><div className="grid min-h-0 flex-1 place-items-center py-3"><div className="grid aspect-square w-[min(27vh,13rem)] place-items-center overflow-hidden rounded-2xl bg-white p-3">{shareUrl ? <img src={`https://quickchart.io/qr?text=${encodeURIComponent(shareUrl)}&size=260&margin=1`} alt="QR-code naar deze verzoeklijst" className="h-full w-full"/> : <Loader2 className="animate-spin text-[#07110d]"/>}</div></div><Button variant="outline" disabled={!shareUrl} onClick={() => { void navigator.clipboard.writeText(shareUrl); setNotice("Link gekopieerd."); }} className="w-full shrink-0 rounded-xl border-white/10 bg-white/[.04] text-white hover:bg-white/10 hover:text-white"><Copy size={16}/>Kopieer link</Button></div>
+            <div className={`absolute inset-0 flex flex-col p-5 transition-all duration-700 ${showQrCard || !topTrack ? "translate-x-0 opacity-100" : "-translate-x-8 opacity-0 pointer-events-none"}`}><div className="flex items-center gap-3"><span className="grid h-10 w-10 place-items-center rounded-xl bg-white/10"><Smartphone size={20}/></span><div className="min-w-0 flex-1"><h3 className="font-bold">Scan & stem</h3><p className="text-xs text-zinc-500">Open de lijst op je telefoon</p></div><span className="rounded-full bg-[#64f5a4]/15 px-3 py-1 text-sm font-black text-[#64f5a4]">{voterCount} {voterCount === 1 ? "stemmer" : "stemmers"}</span></div><div className="grid min-h-0 flex-1 place-items-center py-2"><div className="grid aspect-square w-[min(24vh,11rem)] place-items-center overflow-hidden rounded-2xl bg-white p-3">{shareUrl ? <img src={`https://quickchart.io/qr?text=${encodeURIComponent(shareUrl)}&size=260&margin=1`} alt="QR-code naar deze verzoeklijst" className="h-full w-full"/> : <Loader2 className="animate-spin text-[#07110d]"/>}</div></div>{partyAccess && <div className="mb-2 flex shrink-0 items-center justify-between rounded-xl border border-[#64f5a4]/20 bg-[#64f5a4]/10 px-3 py-2"><span className="text-xs font-bold uppercase tracking-wider text-[#8bd7aa]">Toegangscode</span><strong className="font-mono text-xl tracking-[.18em] text-[#baffd4]">{partyAccess.code}</strong><span className="text-xs tabular-nums text-[#79ba96]">{formatCountdown(partyAccess.expiresInSeconds)}</span></div>}<Button variant="outline" disabled={!shareUrl} onClick={() => { void navigator.clipboard.writeText(shareUrl); setNotice("Link gekopieerd."); }} className="w-full shrink-0 rounded-xl border-white/10 bg-white/[.04] text-white hover:bg-white/10 hover:text-white"><Copy size={16}/>Kopieer link</Button></div>
             {topTrack && <div className={`absolute inset-0 flex flex-col p-5 transition-all duration-700 ${showQrCard ? "translate-x-8 opacity-0 pointer-events-none" : "translate-x-0 opacity-100"}`}><div className="flex items-center justify-between"><span className="rounded-full bg-[#64f5a4] px-3 py-1 text-xs font-black uppercase tracking-wider text-[#07110d]">Hierna #1</span><span className="text-sm font-bold text-[#64f5a4]">{topTrack.votes} {topTrack.votes === 1 ? "stem" : "stemmen"}</span></div><div className="grid min-h-0 flex-1 place-items-center py-3">{topTrack.imageUrl ? <img src={topTrack.imageUrl} alt="Albumhoes" className="aspect-square h-full max-h-[27vh] rounded-2xl object-cover shadow-2xl"/> : <span className="grid aspect-square h-full max-h-[27vh] place-items-center rounded-2xl bg-white/10"><Music2 size={42}/></span>}</div><div className="shrink-0"><h2 className="truncate text-2xl font-black tracking-tight">{topTrack.name}</h2><p className="truncate text-zinc-400">{topTrack.artist}</p></div></div>}
             {topTrack && <div className="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 gap-1.5"><button onClick={() => setShowQrCard(true)} aria-label="Toon QR-code" className={`h-1.5 rounded-full transition-all ${showQrCard ? "w-6 bg-[#64f5a4]" : "w-1.5 bg-white/25"}`}/><button onClick={() => setShowQrCard(false)} aria-label="Toon nummer één" className={`h-1.5 rounded-full transition-all ${!showQrCard ? "w-6 bg-[#64f5a4]" : "w-1.5 bg-white/25"}`}/></div>}
           </div>}
@@ -540,11 +606,11 @@ export default function PartyApp() {
         <div className="pointer-events-none absolute -bottom-[30vh] right-[2vw] h-[75vh] w-[75vh] animate-pulse rounded-full opacity-15 blur-[130px] transition-colors duration-[2000ms] [animation-delay:900ms]" style={{ backgroundColor: partyTheme.primary }}/>
         <div className="pointer-events-none absolute inset-0 overflow-hidden" aria-hidden="true">{["♪","♫","♪","♬","♫","♪"].map((note, index) => <span key={index} className="absolute animate-bounce font-black text-white/[.06]" style={{ left: `${8 + index * 17}%`, top: `${16 + (index % 3) * 25}%`, fontSize: `${28 + (index % 3) * 16}px`, animationDuration: `${3.8 + index * .55}s`, animationDelay: `${index * .45}s` }}>{note}</span>)}</div>
         {leaderCelebration && topTrack && <div className="pointer-events-none absolute left-1/2 top-20 z-[34] -translate-x-1/2 animate-bounce rounded-full border border-white/15 bg-black/75 px-6 py-3 text-center shadow-[0_0_60px_rgba(255,255,255,.2)] backdrop-blur-xl"><p className="text-xs font-black uppercase tracking-[.2em]" style={{ color: partyTheme.primary }}>Nieuwe nummer 1</p><p className="mt-1 max-w-sm truncate text-lg font-black">{topTrack.name}</p></div>}
-        <PartyReactionLayer/>
+        <PartyReactionLayer adminCode={adminCode}/>
         <PartyConfettiLayer burst={confettiBurst}/>
         {transitionTrack && <div className="party-track-transition pointer-events-none absolute inset-0 z-[36] grid place-items-center bg-black/80 p-8 text-center backdrop-blur-xl"><div className="max-w-3xl">{transitionTrack.imageUrl && <img src={transitionTrack.imageUrl} alt="" className="mx-auto mb-6 h-40 w-40 rounded-[28px] object-cover shadow-2xl"/>}<p className="text-sm font-black uppercase tracking-[.28em]" style={{ color: partyTheme.primary }}>Nu begint</p><h2 className="mt-3 line-clamp-2 text-5xl font-black tracking-[-.05em] lg:text-7xl">{transitionTrack.name}</h2><p className="mt-3 text-2xl font-semibold text-zinc-400">{transitionTrack.artist}</p></div></div>}
         <div className="relative flex h-full flex-col px-5 pb-16 pt-5 lg:px-7 lg:pb-[4.5rem] lg:pt-7">
-          <header className="flex shrink-0 items-center justify-between gap-5"><div className="flex items-center gap-3"><span className="grid h-11 w-11 place-items-center rounded-2xl text-[#07110d] transition-colors duration-[2000ms]" style={{ backgroundColor: partyTheme.primary, boxShadow: `0 0 32px ${partyTheme.primary}55` }}><Music2 size={23}/></span><div><p className="text-lg font-black tracking-tight">Stem de Hit</p><p className="text-xs font-bold uppercase tracking-[.22em] transition-colors duration-[2000ms]" style={{ color: partyTheme.secondary }}>Party Mode</p></div></div><div className="flex items-center gap-2"><span className="hidden rounded-full border border-white/10 bg-white/[.05] px-3 py-2 text-sm font-bold text-zinc-300 sm:flex sm:items-center sm:gap-2"><Users size={15}/>{voterCount} {voterCount === 1 ? "stemmer" : "stemmers"}</span><Button variant="outline" onClick={() => void document.documentElement.requestFullscreen?.().catch(() => undefined)} className="rounded-xl border-white/10 bg-white/[.05] text-white hover:bg-white/10 hover:text-white"><Maximize2 size={17}/><span className="hidden sm:inline">Volledig scherm</span></Button><Button variant="outline" onClick={() => setShowHost(true)} className="rounded-xl border-white/10 bg-white/[.05] text-white hover:bg-white/10 hover:text-white"><Settings2 size={17}/><span className="hidden sm:inline">Instellingen</span></Button></div></header>
+          <header className="flex shrink-0 items-center justify-between gap-5"><div className="flex items-center gap-3"><span className="grid h-11 w-11 place-items-center rounded-2xl text-[#07110d] transition-colors duration-[2000ms]" style={{ backgroundColor: partyTheme.primary, boxShadow: `0 0 32px ${partyTheme.primary}55` }}><Music2 size={23}/></span><div><p className="text-lg font-black tracking-tight">Stem de Hit</p><p className="text-xs font-bold uppercase tracking-[.22em] transition-colors duration-[2000ms]" style={{ color: partyTheme.secondary }}>Party Mode</p></div></div><div className="flex items-center gap-2">{partyAccess && <span className="flex items-center gap-3 rounded-xl border border-[#64f5a4]/25 bg-[#64f5a4]/10 px-3 py-1.5"><span className="text-[10px] font-black uppercase tracking-wider text-[#79ba96]">Code</span><strong className="font-mono text-lg tracking-[.16em] text-[#baffd4]">{partyAccess.code}</strong><span className="text-xs tabular-nums text-[#79ba96]">{formatCountdown(partyAccess.expiresInSeconds)}</span></span>}<span className="hidden rounded-full border border-white/10 bg-white/[.05] px-3 py-2 text-sm font-bold text-zinc-300 sm:flex sm:items-center sm:gap-2"><Users size={15}/>{voterCount} {voterCount === 1 ? "stemmer" : "stemmers"}</span><Button variant="outline" onClick={() => void document.documentElement.requestFullscreen?.().catch(() => undefined)} className="rounded-xl border-white/10 bg-white/[.05] text-white hover:bg-white/10 hover:text-white"><Maximize2 size={17}/><span className="hidden sm:inline">Volledig scherm</span></Button><Button variant="outline" onClick={() => setShowHost(true)} className="rounded-xl border-white/10 bg-white/[.05] text-white hover:bg-white/10 hover:text-white"><Settings2 size={17}/><span className="hidden sm:inline">Instellingen</span></Button></div></header>
 
           <div className="mt-5 grid min-h-0 flex-1 gap-5 lg:grid-cols-[minmax(0,1.5fr)_minmax(310px,.72fr)]">
             <div className="relative flex min-h-0 overflow-hidden rounded-[32px] border border-white/10 bg-white/[.045] p-6 shadow-[0_30px_100px_rgba(0,0,0,.5)]">
@@ -553,13 +619,13 @@ export default function PartyApp() {
             </div>
 
             <aside className="flex min-h-0 flex-col gap-4"><div className="min-h-0 flex-1 overflow-hidden rounded-[28px] border border-white/10 bg-white/[.045] p-5"><div className="mb-4 flex items-center justify-between"><div><p className="text-xs font-black uppercase tracking-[.18em] text-[#64f5a4]">Live ranglijst</p><h2 className="mt-1 text-2xl font-black">Hierna</h2></div><span className="rounded-full bg-white/[.06] px-3 py-1.5 text-sm font-bold text-zinc-400">Top 5</span></div><div className="grid gap-3">{candidateTracks.slice(0, 5).map((track, index) => <div key={track.id} className={`flex items-center gap-3 rounded-2xl border p-3 ${index === 0 ? "border-[#64f5a4]/30 bg-[#64f5a4]/10" : "border-white/[.06] bg-white/[.035]"}`}><span className={`grid h-8 w-8 shrink-0 place-items-center rounded-xl text-sm font-black ${index === 0 ? "bg-[#64f5a4] text-[#07110d]" : "bg-white/10 text-zinc-400"}`}>{index + 1}</span>{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-12 w-12 shrink-0 rounded-xl object-cover"/> : <span className="grid h-12 w-12 shrink-0 place-items-center rounded-xl bg-white/10"><Music2 size={18}/></span>}<div className="min-w-0 flex-1"><h3 className="truncate font-black">{track.name}</h3><p className="truncate text-sm text-zinc-500">{track.artist}</p></div><span className="flex items-center gap-1 rounded-xl bg-black/20 px-2.5 py-2 text-sm font-black text-[#64f5a4]"><ChevronUp size={15}/>{track.votes}</span></div>)}{candidateTracks.length === 0 && playback.queue?.slice(0, 5).map((track, index) => <div key={`${track.spotifyId}-${index}`} className="flex items-center gap-3 rounded-2xl border border-white/[.06] bg-white/[.035] p-3"><span className="grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-white/10 text-sm font-black text-zinc-500">{index + 1}</span>{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-12 w-12 shrink-0 rounded-xl object-cover"/> : <span className="grid h-12 w-12 shrink-0 place-items-center rounded-xl bg-white/10"><Music2 size={18}/></span>}<div className="min-w-0"><h3 className="truncate font-bold">{track.name}</h3><p className="truncate text-sm text-zinc-500">{track.artist}</p></div></div>)}{candidateTracks.length === 0 && !playback.queue?.length && <div className="grid min-h-40 place-items-center rounded-2xl border border-dashed border-white/10 text-center text-zinc-600"><div><Music2 className="mx-auto mb-2"/><p>Nog geen nummers klaar</p></div></div>}</div></div>
-              <button onClick={() => setPartyQrOpen(true)} className="flex shrink-0 items-center gap-4 rounded-[24px] border border-[#64f5a4]/20 bg-[#64f5a4]/10 p-4 text-left transition hover:bg-[#64f5a4]/15"><div className="grid h-20 w-20 shrink-0 place-items-center overflow-hidden rounded-xl bg-white p-1.5">{shareUrl ? <img src={`https://quickchart.io/qr?text=${encodeURIComponent(shareUrl)}&size=160&margin=1`} alt="QR-code" className="h-full w-full"/> : <QrCode className="text-[#07110d]"/>}</div><div className="min-w-0 flex-1"><p className="font-black text-[#baffd4]">Nog iemand laten stemmen?</p><p className="mt-1 text-sm text-[#79ba96]">Klik om de QR-code groot te tonen</p></div><QrCode className="shrink-0 text-[#64f5a4]"/></button></aside>
+              <button onClick={() => setPartyQrOpen(true)} className="flex shrink-0 items-center gap-4 rounded-[24px] border border-[#64f5a4]/20 bg-[#64f5a4]/10 p-4 text-left transition hover:bg-[#64f5a4]/15"><div className="grid h-20 w-20 shrink-0 place-items-center overflow-hidden rounded-xl bg-white p-1.5">{shareUrl ? <img src={`https://quickchart.io/qr?text=${encodeURIComponent(shareUrl)}&size=160&margin=1`} alt="QR-code" className="h-full w-full"/> : <QrCode className="text-[#07110d]"/>}</div><div className="min-w-0 flex-1"><p className="font-black text-[#baffd4]">Nog iemand laten stemmen?</p>{partyAccess ? <p className="mt-1 font-mono text-lg font-black tracking-[.15em] text-white">{partyAccess.code}</p> : <p className="mt-1 text-sm text-[#79ba96]">Klik om de QR-code groot te tonen</p>}</div><QrCode className="shrink-0 text-[#64f5a4]"/></button></aside>
           </div>
         </div>
         <div className="absolute inset-x-0 bottom-0 z-[35] h-12 overflow-hidden border-t border-white/10 bg-black/65 backdrop-blur-xl"><div className="party-ticker-track flex h-full items-center">{[...tickerItems, ...tickerItems].map((item, index) => <span key={`${item}-${index}`} className="flex shrink-0 items-center gap-6 px-7 text-sm font-black tracking-wide text-white/90"><span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: partyTheme.primary }}/>{item}</span>)}</div></div>
       </section>}
 
-      {hostMode && partyMode && partyQrOpen && <div className="fixed inset-0 z-[45] grid place-items-center bg-black/85 p-6 backdrop-blur-xl" onClick={() => setPartyQrOpen(false)}><div className="w-full max-w-md rounded-[32px] border border-white/10 bg-[#101914] p-7 text-center shadow-2xl" onClick={(event) => event.stopPropagation()}><div className="mb-5 flex items-center justify-between"><div className="text-left"><p className="text-xs font-black uppercase tracking-[.18em] text-[#64f5a4]">Scan & stem</p><h2 className="mt-1 text-2xl font-black">Doe mee met de muziek</h2></div><button onClick={() => setPartyQrOpen(false)} aria-label="Sluiten" className="grid h-10 w-10 place-items-center rounded-full bg-white/10"><X/></button></div><div className="mx-auto aspect-square w-full rounded-[24px] bg-white p-5">{shareUrl ? <img src={`https://quickchart.io/qr?text=${encodeURIComponent(shareUrl)}&size=520&margin=1`} alt="QR-code naar de verzoeklijst" className="h-full w-full"/> : <Loader2 className="m-auto animate-spin text-[#07110d]"/>}</div><p className="mt-5 text-lg font-black text-[#64f5a4]">{voterCount} {voterCount === 1 ? "stemmer doet" : "stemmers doen"} al mee</p></div></div>}
+      {hostMode && partyMode && partyQrOpen && <div className="fixed inset-0 z-[45] grid place-items-center bg-black/85 p-6 backdrop-blur-xl" onClick={() => setPartyQrOpen(false)}><div className="w-full max-w-md rounded-[32px] border border-white/10 bg-[#101914] p-7 text-center shadow-2xl" onClick={(event) => event.stopPropagation()}><div className="mb-5 flex items-center justify-between"><div className="text-left"><p className="text-xs font-black uppercase tracking-[.18em] text-[#64f5a4]">Scan & stem</p><h2 className="mt-1 text-2xl font-black">Doe mee met de muziek</h2></div><button onClick={() => setPartyQrOpen(false)} aria-label="Sluiten" className="grid h-10 w-10 place-items-center rounded-full bg-white/10"><X/></button></div><div className="mx-auto aspect-square w-full rounded-[24px] bg-white p-5">{shareUrl ? <img src={`https://quickchart.io/qr?text=${encodeURIComponent(shareUrl)}&size=520&margin=1`} alt="QR-code naar de verzoeklijst" className="h-full w-full"/> : <Loader2 className="m-auto animate-spin text-[#07110d]"/>}</div>{partyAccess && <div className="mt-4 rounded-2xl border border-[#64f5a4]/25 bg-[#64f5a4]/10 p-3"><p className="text-xs font-black uppercase tracking-[.18em] text-[#79ba96]">Vul deze code in</p><p className="mt-1 font-mono text-3xl font-black tracking-[.2em] text-[#baffd4]">{partyAccess.code}</p><p className="mt-1 text-xs tabular-nums text-[#79ba96]">Nieuwe code over {formatCountdown(partyAccess.expiresInSeconds)}</p></div>}<p className="mt-4 text-lg font-black text-[#64f5a4]">{voterCount} {voterCount === 1 ? "stemmer doet" : "stemmers doen"} al mee</p></div></div>}
 
       {showHost && <div className="fixed inset-0 z-50 grid place-items-end bg-black/70 p-0 backdrop-blur-sm sm:place-items-center sm:p-5" onMouseDown={(e) => { if (e.target === e.currentTarget) setShowHost(false); }}>
         <section className="max-h-[92vh] w-full max-w-xl overflow-y-auto rounded-t-[28px] border border-white/10 bg-[#101914] p-6 shadow-2xl sm:rounded-[28px] sm:p-8">
