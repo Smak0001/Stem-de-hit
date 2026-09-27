@@ -14,6 +14,7 @@ type Device = { id: string; name: string; type: string; is_active: boolean };
 type Playback = { active: boolean; isPlaying?: boolean; progressMs?: number; item?: SearchTrack; queue?: SearchTrack[]; device?: { id: string; name: string; type: string } | null };
 type ReactionEvent = { id: number; emoji: string; createdAt: number };
 type ReactionParticle = ReactionEvent & { x: number; drift: number; rotation: number };
+type ReactionCombo = { id: number; emoji: string | null; count: number };
 type PartyCodeInfo = { code: string; rotatesAt: number; expiresInSeconds: number };
 
 const PARTY_THEMES = [
@@ -53,7 +54,7 @@ function formatCountdown(seconds: number) {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
-function PartyReactionLayer({ adminCode }: { adminCode: string }) {
+function PartyReactionLayer({ adminCode, onCombo }: { adminCode: string; onCombo: (combo: Omit<ReactionCombo, "id">) => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cursorRef = useRef(0);
 
@@ -67,6 +68,8 @@ function PartyReactionLayer({ adminCode }: { adminCode: string }) {
     let height = 0;
     let lastPaint = 0;
     let particles: ReactionParticle[] = [];
+    let recentReactions: ReactionEvent[] = [];
+    let lastComboAt = 0;
 
     const resize = () => {
       const rect = canvas.getBoundingClientRect();
@@ -111,6 +114,16 @@ function PartyReactionLayer({ adminCode }: { adminCode: string }) {
         rotation: reaction.id % 2 === 0 ? 14 : -14,
       })));
       particles = particles.slice(-70);
+      const now = Date.now();
+      recentReactions = [...recentReactions, ...incoming].filter((reaction) => now - reaction.createdAt <= 3000);
+      if (recentReactions.length >= 10 && now - lastComboAt >= 4200) {
+        const counts = new Map<string, number>();
+        for (const reaction of recentReactions) counts.set(reaction.emoji, (counts.get(reaction.emoji) || 0) + 1);
+        const dominant = [...counts.entries()].sort((left, right) => right[1] - left[1])[0];
+        onCombo({ emoji: dominant && dominant[1] >= 7 ? dominant[0] : null, count: recentReactions.length });
+        lastComboAt = now;
+        recentReactions = [];
+      }
       startDrawing();
     };
 
@@ -132,7 +145,7 @@ function PartyReactionLayer({ adminCode }: { adminCode: string }) {
       observer.disconnect();
       if (frame !== null) cancelAnimationFrame(frame);
     };
-  }, [adminCode]);
+  }, [adminCode, onCombo]);
 
   return <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 z-30 h-full w-full" aria-hidden="true"/>;
 }
@@ -221,6 +234,9 @@ export default function PartyApp() {
   const [confettiBurst, setConfettiBurst] = useState(0);
   const [partyThemeIndex, setPartyThemeIndex] = useState(0);
   const [transitionTrack, setTransitionTrack] = useState<SearchTrack | null>(null);
+  const [reactionCombo, setReactionCombo] = useState<ReactionCombo | null>(null);
+  const [newRequestTrack, setNewRequestTrack] = useState<Track | null>(null);
+  const [voteFlashId, setVoteFlashId] = useState<number | null>(null);
   const [showQrCard, setShowQrCard] = useState(true);
   const triggeredFor = useRef("");
   const lastPlaybackId = useRef<string | null>(null);
@@ -233,6 +249,14 @@ export default function PartyApp() {
   const pendingReactions = useRef<string[]>([]);
   const reactionFlushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reactionFlushBusy = useRef(false);
+  const partyTrackingReady = useRef(false);
+  const knownCandidateIds = useRef(new Set<number>());
+  const knownCandidateVotes = useRef(new Map<number, number>());
+
+  const handleReactionCombo = useCallback((combo: Omit<ReactionCombo, "id">) => {
+    setReactionCombo({ ...combo, id: Date.now() });
+    if (combo.emoji === "🎉") setConfettiBurst((current) => current + 1);
+  }, []);
 
   const refresh = useCallback(async () => {
     const adminQuery = hostMode && adminCode ? `&adminCode=${encodeURIComponent(adminCode)}` : "";
@@ -312,6 +336,47 @@ export default function PartyApp() {
     topTrack && topTrack.votes >= 10 ? `🎉 Stemmijlpaal: ${topTrack.votes} stemmen op ${topTrack.name}` : `🙌 ${voterCount} ${voterCount === 1 ? "stemmer doet" : "stemmers doen"} mee`,
     `🎨 Thema: ${partyTheme.name}`,
   ];
+
+  useEffect(() => {
+    if (!reactionCombo) return;
+    const timer = setTimeout(() => setReactionCombo(null), 3400);
+    return () => clearTimeout(timer);
+  }, [reactionCombo?.id]);
+
+  useEffect(() => {
+    if (!newRequestTrack) return;
+    const timer = setTimeout(() => setNewRequestTrack(null), 4200);
+    return () => clearTimeout(timer);
+  }, [newRequestTrack?.id]);
+
+  useEffect(() => {
+    if (voteFlashId === null) return;
+    const timer = setTimeout(() => setVoteFlashId(null), 1100);
+    return () => clearTimeout(timer);
+  }, [voteFlashId]);
+
+  useEffect(() => {
+    const currentIds = new Set(candidateTracks.map((track) => track.id));
+    const currentVotes = new Map(candidateTracks.map((track) => [track.id, track.votes]));
+    if (!partyMode) {
+      partyTrackingReady.current = false;
+      knownCandidateIds.current = currentIds;
+      knownCandidateVotes.current = currentVotes;
+      return;
+    }
+    if (!partyTrackingReady.current) {
+      partyTrackingReady.current = true;
+      knownCandidateIds.current = currentIds;
+      knownCandidateVotes.current = currentVotes;
+      return;
+    }
+    const added = candidateTracks.filter((track) => !knownCandidateIds.current.has(track.id)).sort((left, right) => right.id - left.id)[0];
+    if (added) setNewRequestTrack(added);
+    const increased = candidateTracks.filter((track) => track.votes > (knownCandidateVotes.current.get(track.id) ?? track.votes)).sort((left, right) => (right.votes - (knownCandidateVotes.current.get(right.id) || 0)) - (left.votes - (knownCandidateVotes.current.get(left.id) || 0)))[0];
+    if (increased) setVoteFlashId(increased.id);
+    knownCandidateIds.current = currentIds;
+    knownCandidateVotes.current = currentVotes;
+  }, [partyMode, tracks]);
 
   useEffect(() => {
     if (!partyMode || !topTrack) { previousLeaderId.current = topTrack?.id || null; setLeaderCelebration(false); return; }
@@ -547,6 +612,7 @@ export default function PartyApp() {
 
   const shownTracks = hostMode ? candidateTracks.slice(0, 5) : candidateTracks;
   const queueFillTracks = spotifyQueueTracks.slice(0, hostMode ? Math.max(0, 5 - shownTracks.length) : 5);
+  const comboVisual = reactionCombo?.emoji === "🔥" ? { title: "Vuurzee!", emoji: "🔥", kind: "fire" } : reactionCombo?.emoji === "❤️" ? { title: "Hartjesregen!", emoji: "❤️", kind: "heart" } : reactionCombo?.emoji === "🎉" ? { title: "Feestexplosie!", emoji: "🎉", kind: "party" } : reactionCombo?.emoji === "🙌" ? { title: "Handen in de lucht!", emoji: "🙌", kind: "hands" } : { title: "Crowd gaat los!", emoji: "⚡", kind: "generic" };
 
   if (!appReady) return <main className="grid min-h-[100dvh] place-items-center overflow-hidden bg-[#07110d] text-[#64f5a4]"><Loader2 className="animate-spin" size={32}/></main>;
 
@@ -612,8 +678,10 @@ export default function PartyApp() {
         <div className="pointer-events-none absolute -bottom-[30vh] right-[2vw] h-[75vh] w-[75vh] animate-pulse rounded-full opacity-15 blur-[130px] transition-colors duration-[2000ms] [animation-delay:900ms]" style={{ backgroundColor: partyTheme.primary }}/>
         <div className="pointer-events-none absolute inset-0 overflow-hidden" aria-hidden="true">{["♪","♫","♪","♬","♫","♪"].map((note, index) => <span key={index} className="absolute animate-bounce font-black text-white/[.06]" style={{ left: `${8 + index * 17}%`, top: `${16 + (index % 3) * 25}%`, fontSize: `${28 + (index % 3) * 16}px`, animationDuration: `${3.8 + index * .55}s`, animationDelay: `${index * .45}s` }}>{note}</span>)}</div>
         {leaderCelebration && topTrack && <div className="pointer-events-none absolute left-1/2 top-20 z-[34] -translate-x-1/2 animate-bounce rounded-full border border-white/15 bg-black/75 px-6 py-3 text-center shadow-[0_0_60px_rgba(255,255,255,.2)] backdrop-blur-xl"><p className="text-xs font-black uppercase tracking-[.2em]" style={{ color: partyTheme.primary }}>Nieuwe nummer 1</p><p className="mt-1 max-w-sm truncate text-lg font-black">{topTrack.name}</p></div>}
-        <PartyReactionLayer adminCode={adminCode}/>
+        <PartyReactionLayer adminCode={adminCode} onCombo={handleReactionCombo}/>
         <PartyConfettiLayer burst={confettiBurst}/>
+        {newRequestTrack && <div key={newRequestTrack.id} className="party-new-request pointer-events-none absolute bottom-16 left-6 z-[34] flex max-w-sm items-center gap-4 rounded-[24px] border border-white/15 bg-black/75 p-4 shadow-[0_24px_80px_rgba(0,0,0,.55)] backdrop-blur-xl">{newRequestTrack.imageUrl ? <img src={newRequestTrack.imageUrl} alt="" className="h-16 w-16 shrink-0 rounded-2xl object-cover"/> : <span className="grid h-16 w-16 shrink-0 place-items-center rounded-2xl bg-white/10"><Music2/></span>}<div className="min-w-0"><p className="text-xs font-black uppercase tracking-[.18em]" style={{ color: partyTheme.primary }}>Nieuw verzoek binnen</p><h2 className="mt-1 truncate text-xl font-black">{newRequestTrack.name}</h2><p className="truncate text-sm text-zinc-400">{newRequestTrack.artist}</p></div></div>}
+        {reactionCombo && <div key={reactionCombo.id} className={`party-combo-layer party-combo-${comboVisual.kind} pointer-events-none absolute inset-0 z-[38] overflow-hidden`}><span className="party-combo-shockwave absolute left-1/2 top-1/2 h-36 w-36 -translate-x-1/2 -translate-y-1/2 rounded-full border-4" style={{ borderColor: partyTheme.primary }}/>{Array.from({ length: 18 }, (_, index) => <span key={index} className="party-combo-particle absolute text-4xl" style={{ left: `${3 + (index * 37) % 94}%`, animationDelay: `${(index % 6) * .1}s`, animationDuration: `${2 + (index % 4) * .18}s` }}>{comboVisual.emoji}</span>)}<div className="party-combo-banner absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-[28px] border border-white/15 bg-black/80 px-8 py-5 text-center shadow-[0_0_80px_rgba(255,255,255,.18)] backdrop-blur-xl"><p className="text-5xl">{comboVisual.emoji}</p><h2 className="mt-2 whitespace-nowrap text-4xl font-black tracking-[-.04em]">{comboVisual.title}</h2><p className="mt-2 font-bold text-zinc-300">{reactionCombo.count} reacties in 3 seconden</p></div></div>}
         {transitionTrack && <div className="party-track-transition pointer-events-none absolute inset-0 z-[36] grid place-items-center bg-black/80 p-8 text-center backdrop-blur-xl"><div className="max-w-3xl">{transitionTrack.imageUrl && <img src={transitionTrack.imageUrl} alt="" className="mx-auto mb-6 h-40 w-40 rounded-[28px] object-cover shadow-2xl"/>}<p className="text-sm font-black uppercase tracking-[.28em]" style={{ color: partyTheme.primary }}>Nu begint</p><h2 className="mt-3 line-clamp-2 text-5xl font-black tracking-[-.05em] lg:text-7xl">{transitionTrack.name}</h2><p className="mt-3 text-2xl font-semibold text-zinc-400">{transitionTrack.artist}</p></div></div>}
         <div className="relative flex h-full flex-col px-5 pb-16 pt-5 lg:px-7 lg:pb-[4.5rem] lg:pt-7">
           <header className="flex shrink-0 items-center justify-between gap-5"><div className="flex items-center gap-3"><span className="grid h-11 w-11 place-items-center rounded-2xl text-[#07110d] transition-colors duration-[2000ms]" style={{ backgroundColor: partyTheme.primary, boxShadow: `0 0 32px ${partyTheme.primary}55` }}><Music2 size={23}/></span><div><p className="text-lg font-black tracking-tight">Stem de Hit</p><p className="text-xs font-bold uppercase tracking-[.22em] transition-colors duration-[2000ms]" style={{ color: partyTheme.secondary }}>Party Mode · {partyTheme.name}</p></div></div><div className="flex items-center gap-2"><span className="hidden rounded-full border border-white/10 bg-white/[.05] px-3 py-2 text-sm font-bold text-zinc-300 sm:flex sm:items-center sm:gap-2"><Users size={15}/>{voterCount} {voterCount === 1 ? "stemmer" : "stemmers"}</span><Button variant="outline" onClick={() => void document.documentElement.requestFullscreen?.().catch(() => undefined)} className="rounded-xl border-white/10 bg-white/[.05] text-white hover:bg-white/10 hover:text-white"><Maximize2 size={17}/><span className="hidden sm:inline">Volledig scherm</span></Button><Button variant="outline" onClick={() => setShowHost(true)} className="rounded-xl border-white/10 bg-white/[.05] text-white hover:bg-white/10 hover:text-white"><Settings2 size={17}/><span className="hidden sm:inline">Instellingen</span></Button></div></header>
@@ -621,10 +689,10 @@ export default function PartyApp() {
           <div className="mt-5 grid min-h-0 flex-1 gap-5 lg:grid-cols-[minmax(0,1.5fr)_minmax(310px,.72fr)]">
             <div className="relative flex min-h-0 overflow-hidden rounded-[32px] border border-white/10 bg-white/[.045] p-6 shadow-[0_30px_100px_rgba(0,0,0,.5)]">
               {remainingSeconds !== null && remainingSeconds > 0 && remainingSeconds <= 15 && <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center bg-black/55 backdrop-blur-sm"><div className="text-center"><p className="text-sm font-black uppercase tracking-[.28em]" style={{ color: partyTheme.primary }}>Volgende nummer over</p><span key={remainingSeconds} className="party-countdown-number mt-2 block text-[clamp(7rem,22vw,14rem)] font-black leading-none tracking-[-.08em]">{remainingSeconds}</span></div></div>}
-              {playback.active && playback.item ? <div className="grid min-h-0 w-full items-center gap-7 lg:grid-cols-[minmax(260px,.9fr)_minmax(0,1.1fr)]"><div className="grid min-h-0 place-items-center">{playback.item.imageUrl ? <img src={playback.item.imageUrl} alt="Albumhoes" className="aspect-square max-h-[62vh] w-full max-w-[min(58vh,34rem)] rounded-[28px] object-contain shadow-[0_32px_90px_rgba(0,0,0,.65)]"/> : <span className="grid aspect-square w-full max-w-[min(58vh,34rem)] place-items-center rounded-[28px] bg-white/10"><Music2 size={70}/></span>}</div><div className="min-w-0"><span className="mb-5 inline-flex items-center gap-2 rounded-full bg-[#64f5a4] px-4 py-2 text-xs font-black uppercase tracking-[.16em] text-[#07110d]"><Volume2 size={15}/>Nu speelt</span><h1 className="line-clamp-2 text-5xl font-black leading-[.92] tracking-[-.055em] xl:text-7xl">{playback.item.name}</h1><p className="mt-4 truncate text-2xl font-semibold text-zinc-400 xl:text-3xl">{playback.item.artist}</p><div className="mt-8"><div className="mb-2 flex justify-between text-sm font-bold text-zinc-500"><span>{formatDuration(playback.progressMs || 0)}</span><span>{formatDuration(playback.item.durationMs)}</span></div><div className="h-2.5 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-fuchsia-400 to-[#64f5a4] transition-all duration-700" style={{ width: `${Math.min(100, Math.max(0, ((playback.progressMs || 0) / Math.max(1, playback.item.durationMs)) * 100))}%` }}/></div></div><div className="mt-7 flex h-12 items-end gap-2" aria-hidden="true">{[42,72,54,92,64,38,80,58,96,48,70,40].map((height, index) => <span key={index} className="w-2 animate-pulse rounded-full bg-gradient-to-t from-fuchsia-500 to-[#64f5a4]" style={{ height: `${height}%`, animationDelay: `${index * 90}ms` }}/>)}</div></div></div> : <div className="m-auto text-center"><span className="mx-auto grid h-24 w-24 place-items-center rounded-[30px] bg-white/[.06] text-zinc-600"><Headphones size={48}/></span><h1 className="mt-6 text-4xl font-black">Start Spotify op de laptop</h1><p className="mt-2 text-lg text-zinc-500">Party Mode springt vanzelf aan zodra de muziek speelt.</p></div>}
+              {playback.active && playback.item ? <div className="grid min-h-0 w-full items-center gap-7 lg:grid-cols-[minmax(260px,.9fr)_minmax(0,1.1fr)]"><div className="grid min-h-0 place-items-center">{playback.item.imageUrl ? <img src={playback.item.imageUrl} alt="Albumhoes" className="party-album-pulse aspect-square max-h-[62vh] w-full max-w-[min(58vh,34rem)] rounded-[28px] object-contain shadow-[0_32px_90px_rgba(0,0,0,.65)]"/> : <span className="party-album-pulse grid aspect-square w-full max-w-[min(58vh,34rem)] place-items-center rounded-[28px] bg-white/10"><Music2 size={70}/></span>}</div><div className="min-w-0"><span className="mb-5 inline-flex items-center gap-2 rounded-full bg-[#64f5a4] px-4 py-2 text-xs font-black uppercase tracking-[.16em] text-[#07110d]"><Volume2 size={15}/>Nu speelt</span><h1 className="line-clamp-2 text-5xl font-black leading-[.92] tracking-[-.055em] xl:text-7xl">{playback.item.name}</h1><p className="mt-4 truncate text-2xl font-semibold text-zinc-400 xl:text-3xl">{playback.item.artist}</p><div className="mt-8"><div className="mb-2 flex justify-between text-sm font-bold text-zinc-500"><span>{formatDuration(playback.progressMs || 0)}</span><span>{formatDuration(playback.item.durationMs)}</span></div><div className="h-2.5 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-fuchsia-400 to-[#64f5a4] transition-all duration-700" style={{ width: `${Math.min(100, Math.max(0, ((playback.progressMs || 0) / Math.max(1, playback.item.durationMs)) * 100))}%` }}/></div></div><div className="mt-7 flex h-12 items-end gap-2" aria-hidden="true">{[42,72,54,92,64,38,80,58,96,48,70,40].map((height, index) => <span key={index} className="w-2 animate-pulse rounded-full bg-gradient-to-t from-fuchsia-500 to-[#64f5a4]" style={{ height: `${height}%`, animationDelay: `${index * 90}ms` }}/>)}</div></div></div> : <div className="m-auto text-center"><span className="mx-auto grid h-24 w-24 place-items-center rounded-[30px] bg-white/[.06] text-zinc-600"><Headphones size={48}/></span><h1 className="mt-6 text-4xl font-black">Start Spotify op de laptop</h1><p className="mt-2 text-lg text-zinc-500">Party Mode springt vanzelf aan zodra de muziek speelt.</p></div>}
             </div>
 
-            <aside className="flex min-h-0 flex-col gap-4"><div className="min-h-0 flex-1 overflow-hidden rounded-[28px] border border-white/10 bg-white/[.045] p-5"><div className="mb-4 flex items-center justify-between"><div><p className="text-xs font-black uppercase tracking-[.18em] text-[#64f5a4]">Live ranglijst</p><h2 className="mt-1 text-2xl font-black">Hierna</h2></div><span className="rounded-full bg-white/[.06] px-3 py-1.5 text-sm font-bold text-zinc-400">Top 5</span></div><div className="grid gap-3">{candidateTracks.slice(0, 5).map((track, index) => <div key={track.id} className={`flex items-center gap-3 rounded-2xl border p-3 ${index === 0 ? "border-[#64f5a4]/30 bg-[#64f5a4]/10" : "border-white/[.06] bg-white/[.035]"}`}><span className={`grid h-8 w-8 shrink-0 place-items-center rounded-xl text-sm font-black ${index === 0 ? "bg-[#64f5a4] text-[#07110d]" : "bg-white/10 text-zinc-400"}`}>{index + 1}</span>{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-12 w-12 shrink-0 rounded-xl object-cover"/> : <span className="grid h-12 w-12 shrink-0 place-items-center rounded-xl bg-white/10"><Music2 size={18}/></span>}<div className="min-w-0 flex-1"><h3 className="truncate font-black">{track.name}</h3><p className="truncate text-sm text-zinc-500">{track.artist}</p></div><span className="flex items-center gap-1 rounded-xl bg-black/20 px-2.5 py-2 text-sm font-black text-[#64f5a4]"><ChevronUp size={15}/>{track.votes}</span></div>)}{candidateTracks.length === 0 && playback.queue?.slice(0, 5).map((track, index) => <div key={`${track.spotifyId}-${index}`} className="flex items-center gap-3 rounded-2xl border border-white/[.06] bg-white/[.035] p-3"><span className="grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-white/10 text-sm font-black text-zinc-500">{index + 1}</span>{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-12 w-12 shrink-0 rounded-xl object-cover"/> : <span className="grid h-12 w-12 shrink-0 place-items-center rounded-xl bg-white/10"><Music2 size={18}/></span>}<div className="min-w-0"><h3 className="truncate font-bold">{track.name}</h3><p className="truncate text-sm text-zinc-500">{track.artist}</p></div></div>)}{candidateTracks.length === 0 && !playback.queue?.length && <div className="grid min-h-40 place-items-center rounded-2xl border border-dashed border-white/10 text-center text-zinc-600"><div><Music2 className="mx-auto mb-2"/><p>Nog geen nummers klaar</p></div></div>}</div></div>
+            <aside className="flex min-h-0 flex-col gap-4"><div className="min-h-0 flex-1 overflow-hidden rounded-[28px] border border-white/10 bg-white/[.045] p-5"><div className="mb-4 flex items-center justify-between"><div><p className="text-xs font-black uppercase tracking-[.18em] text-[#64f5a4]">Live ranglijst</p><h2 className="mt-1 text-2xl font-black">Hierna</h2></div><span className="rounded-full bg-white/[.06] px-3 py-1.5 text-sm font-bold text-zinc-400">Top 5</span></div><div className="grid gap-3">{candidateTracks.slice(0, 5).map((track, index) => <div key={track.id} className={`flex items-center gap-3 rounded-2xl border p-3 ${index === 0 ? "border-[#64f5a4]/30 bg-[#64f5a4]/10" : "border-white/[.06] bg-white/[.035]"} ${voteFlashId === track.id ? "party-vote-flash" : ""}`}><span className={`grid h-8 w-8 shrink-0 place-items-center rounded-xl text-sm font-black ${index === 0 ? "bg-[#64f5a4] text-[#07110d]" : "bg-white/10 text-zinc-400"}`}>{index + 1}</span>{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-12 w-12 shrink-0 rounded-xl object-cover"/> : <span className="grid h-12 w-12 shrink-0 place-items-center rounded-xl bg-white/10"><Music2 size={18}/></span>}<div className="min-w-0 flex-1"><h3 className="truncate font-black">{track.name}</h3><p className="truncate text-sm text-zinc-500">{track.artist}</p></div><span className="flex items-center gap-1 rounded-xl bg-black/20 px-2.5 py-2 text-sm font-black text-[#64f5a4]"><ChevronUp size={15}/>{track.votes}</span></div>)}{candidateTracks.length === 0 && playback.queue?.slice(0, 5).map((track, index) => <div key={`${track.spotifyId}-${index}`} className="flex items-center gap-3 rounded-2xl border border-white/[.06] bg-white/[.035] p-3"><span className="grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-white/10 text-sm font-black text-zinc-500">{index + 1}</span>{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-12 w-12 shrink-0 rounded-xl object-cover"/> : <span className="grid h-12 w-12 shrink-0 place-items-center rounded-xl bg-white/10"><Music2 size={18}/></span>}<div className="min-w-0"><h3 className="truncate font-bold">{track.name}</h3><p className="truncate text-sm text-zinc-500">{track.artist}</p></div></div>)}{candidateTracks.length === 0 && !playback.queue?.length && <div className="grid min-h-40 place-items-center rounded-2xl border border-dashed border-white/10 text-center text-zinc-600"><div><Music2 className="mx-auto mb-2"/><p>Nog geen nummers klaar</p></div></div>}</div></div>
               <button onClick={() => setPartyQrOpen(true)} className="flex shrink-0 items-center gap-4 rounded-[24px] border border-[#64f5a4]/20 bg-[#64f5a4]/10 p-4 text-left transition hover:bg-[#64f5a4]/15"><div className="grid h-20 w-20 shrink-0 place-items-center overflow-hidden rounded-xl bg-white p-1.5">{shareUrl ? <img src={`https://quickchart.io/qr?text=${encodeURIComponent(shareUrl)}&size=160&margin=1`} alt="QR-code" className="h-full w-full"/> : <QrCode className="text-[#07110d]"/>}</div><div className="min-w-0 flex-1"><p className="font-black text-[#baffd4]">Nog iemand laten stemmen?</p>{partyAccess ? <p className="mt-1 font-mono text-lg font-black tracking-[.15em] text-white">{partyAccess.code}</p> : <p className="mt-1 text-sm text-[#79ba96]">Klik om de QR-code groot te tonen</p>}</div><QrCode className="shrink-0 text-[#64f5a4]"/></button></aside>
           </div>
         </div>
