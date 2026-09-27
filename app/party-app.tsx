@@ -546,14 +546,14 @@ export default function PartyApp() {
 
   if (!hostMode && !joined) return (
     <main className="grid min-h-[100dvh] w-full max-w-full place-items-center overflow-x-hidden bg-[radial-gradient(circle_at_50%_0%,rgba(100,245,164,.16),transparent_38%),linear-gradient(145deg,#07110d,#050907)] px-4 py-8 text-white">
-      <section className="w-full max-w-sm rounded-[28px] border border-white/10 bg-[#0e1914]/95 p-5 text-center shadow-[0_30px_100px_rgba(0,0,0,.55)] min-[360px]:p-7">
+      <section className="w-[calc(100vw-2rem)] max-w-sm rounded-[28px] border border-white/10 bg-[#0e1914]/95 p-5 text-center shadow-[0_30px_100px_rgba(0,0,0,.55)] min-[360px]:p-6">
         <span className="mx-auto grid h-14 w-14 place-items-center rounded-2xl bg-[#64f5a4] text-[#07110d] shadow-[0_0_38px_rgba(100,245,164,.3)]"><LockKeyhole size={27}/></span>
         <p className="mt-5 text-xs font-black uppercase tracking-[.2em] text-[#64f5a4]">Alleen voor aanwezige gasten</p>
         <h1 className="mt-2 text-3xl font-black tracking-[-.045em]">Vul de code van het scherm in</h1>
         <p className="mx-auto mt-3 max-w-xs text-sm leading-6 text-zinc-400">De code staat bij de QR-code op de tv en wisselt automatisch.</p>
         <form onSubmit={joinParty} className="mt-6">
           <InputOTP autoFocus maxLength={6} pattern="^[a-zA-Z0-9]*$" value={joinCode} onChange={(value) => { setJoinCode(value.toUpperCase()); setJoinError(""); }} containerClassName="w-full justify-center" aria-label="Toegangscode">
-            <InputOTPGroup className="gap-1.5 min-[360px]:gap-2">{Array.from({ length: 6 }, (_, index) => <InputOTPSlot key={index} index={index} className="h-12 w-10 rounded-xl border border-white/10 bg-white/[.06] text-lg font-black uppercase text-white shadow-none first:rounded-xl first:border last:rounded-xl min-[360px]:h-14 min-[360px]:w-11"/>)}</InputOTPGroup>
+            <InputOTPGroup className="gap-1 min-[360px]:gap-1.5 min-[390px]:gap-2">{Array.from({ length: 6 }, (_, index) => <InputOTPSlot key={index} index={index} className="h-12 w-8 rounded-xl border border-white/10 bg-white/[.06] text-lg font-black uppercase text-white shadow-none first:rounded-xl first:border last:rounded-xl min-[360px]:h-13 min-[360px]:w-9 min-[390px]:h-14 min-[390px]:w-10"/>)}</InputOTPGroup>
           </InputOTP>
           {joinError && <p role="alert" className="mt-3 text-sm font-semibold text-red-300">{joinError}</p>}
           <Button type="submit" disabled={joining || joinCode.length !== 6} className="mt-5 h-12 w-full rounded-xl bg-[#64f5a4] font-black text-[#07110d] hover:bg-[#8affba]">{joining ? <><Loader2 className="animate-spin"/>Controleren</> : "Meedoen"}</Button>
