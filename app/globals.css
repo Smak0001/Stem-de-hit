@@ -24,6 +24,11 @@ html { background: #07110d; }
 body { margin: 0; background: var(--background); color: var(--foreground); font-family: var(--font-sans); }
 button, a, input { -webkit-tap-highlight-color: transparent; }
 
+@media (max-width: 1023px) {
+  html, body { width: 100%; max-width: 100%; overflow-x: hidden; }
+  body { min-width: 0; }
+}
+
 @keyframes party-countdown-pop {
   0% { opacity: .25; transform: scale(.72); }
   45% { opacity: 1; transform: scale(1.08); }
