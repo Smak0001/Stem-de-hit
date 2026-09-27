@@ -3,7 +3,7 @@ import { getOrCreateSetting, getSetting, setSettings } from "@/db/repository";
 const ACCESS_COOKIE = "stem-party-access";
 const CODE_ROTATION_MS = 5 * 60 * 1000;
 const TOKEN_LIFETIME_SECONDS = 12 * 60 * 60;
-const ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+const DIGITS = "0123456789";
 
 function secret() {
   const value = process.env.ADMIN_CODE;
@@ -36,12 +36,12 @@ async function partySeed() {
 }
 
 function normalizeCode(value: string) {
-  return value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
+  return value.replace(/\D/g, "").slice(0, 6);
 }
 
 async function codeFor(seed: string, period: number) {
   const digest = await hmac(`${seed}:join-code:${period}`);
-  return Array.from(digest.slice(0, 6), (byte) => ALPHABET[byte % ALPHABET.length]).join("");
+  return Array.from(digest.slice(0, 6), (byte) => DIGITS[byte % DIGITS.length]).join("");
 }
 
 export async function getCurrentPartyCode(now = Date.now()) {
