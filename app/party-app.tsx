@@ -214,6 +214,10 @@ export default function PartyApp() {
   const [joining, setJoining] = useState(false);
   const [partyAccess, setPartyAccess] = useState<PartyCodeInfo | null>(null);
   const [showHost, setShowHost] = useState(false);
+  const [changingSpotify, setChangingSpotify] = useState(false);
+  const [newSpotifyParty, setNewSpotifyParty] = useState(false);
+  const [spotifyConnecting, setSpotifyConnecting] = useState(false);
+  const [spotifyConnectError, setSpotifyConnectError] = useState("");
   const [adminCode, setAdminCode] = useState("");
   const [clientId, setClientId] = useState("");
   const [devices, setDevices] = useState<Device[]>([]);
@@ -236,6 +240,7 @@ export default function PartyApp() {
   const triggeredFor = useRef("");
   const lastPlaybackId = useRef<string | null>(null);
   const autoDjBusy = useRef(false);
+  const spotifyCallbackStarted = useRef(false);
   const previousPlayback = useRef<EndObservation | null>(null);
   const autoDjRetryAt = useRef(0);
   const commandForTrack = useRef<{ uri: string; id: string } | null>(null);
@@ -279,6 +284,7 @@ export default function PartyApp() {
     setHostMode(isHost);
     setShareUrl(`${location.origin}/`);
     setAdminCode(localStorage.getItem("stem-de-hit-admin") || "");
+    setClientId(localStorage.getItem("stem-de-hit-client") || "");
     setAutoDj(localStorage.getItem("stem-de-hit-auto-dj") !== "false");
     setPartyMode(localStorage.getItem("stem-de-hit-party-mode") === "true");
     if (isHost) { setJoined(true); setAppReady(true); return; }
@@ -326,7 +332,12 @@ export default function PartyApp() {
   useEffect(() => {
     const params = new URLSearchParams(location.search);
     const code = params.get("code");
-    if (code && hostMode) void completeSpotifyLogin(code, params.get("state")).catch((error) => setNotice(error.message));
+    if (!hostMode || spotifyCallbackStarted.current || (!code && !params.has("error"))) return;
+    spotifyCallbackStarted.current = true;
+    setShowHost(true); setSpotifyConnecting(true);
+    const failed = (message: string) => { history.replaceState({}, "", "/?host=1"); setChangingSpotify(true); setSpotifyConnectError(message); setSpotifyConnecting(false); };
+    if (params.has("error")) { failed("Aanmelden bij Spotify is geannuleerd. Je bestaande koppeling is niet gewijzigd."); return; }
+    if (code) void completeSpotifyLogin(code, params.get("state")).catch((error) => failed(error.message));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostMode]);
 
@@ -538,28 +549,39 @@ export default function PartyApp() {
   }
 
   async function beginSpotifyLogin() {
-    if (!clientId.trim() || !adminCode.trim()) { setNotice("Vul je Spotify Client ID en beheercode in."); return; }
+    if (spotifyConnecting) return;
+    if (!clientId.trim() || !adminCode.trim()) { setSpotifyConnectError("Vul je Spotify Client ID en beheercode in."); return; }
+    setSpotifyConnecting(true); setSpotifyConnectError("");
+    try {
+    await jsonFetch(`/api/host/party-code?adminCode=${encodeURIComponent(adminCode.trim())}`, { cache: "no-store" });
+    setAutoDj(false); localStorage.setItem("stem-de-hit-auto-dj", "false");
+    sessionStorage.setItem("spotify-new-party", String(newSpotifyParty));
+    sessionStorage.setItem("spotify-login-client", clientId.trim()); sessionStorage.setItem("spotify-login-admin", adminCode.trim());
     localStorage.setItem("stem-de-hit-admin", adminCode.trim()); localStorage.setItem("stem-de-hit-client", clientId.trim());
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
     const verifier = Array.from(crypto.getRandomValues(new Uint8Array(64)), (n) => chars[n % chars.length]).join("");
-    localStorage.setItem("spotify-verifier", verifier);
+    sessionStorage.setItem("spotify-verifier", verifier);
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
     const challenge = btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-    const state = crypto.randomUUID(); localStorage.setItem("spotify-state", state);
+    const state = crypto.randomUUID(); sessionStorage.setItem("spotify-state", state);
     const auth = new URL("https://accounts.spotify.com/authorize");
-    auth.search = new URLSearchParams({ client_id: clientId.trim(), response_type: "code", redirect_uri: `${location.origin}/?host=1`, scope: "user-read-playback-state user-read-currently-playing user-modify-playback-state playlist-read-private playlist-read-collaborative", code_challenge_method: "S256", code_challenge: challenge, state }).toString();
+    auth.search = new URLSearchParams({ client_id: clientId.trim(), response_type: "code", redirect_uri: `${location.origin}/?host=1`, scope: "user-read-playback-state user-read-currently-playing user-modify-playback-state playlist-read-private playlist-read-collaborative", code_challenge_method: "S256", code_challenge: challenge, state, show_dialog: "true" }).toString();
     location.href = auth.toString();
+    } catch (error) { setSpotifyConnectError(error instanceof Error ? error.message : "Koppelen is niet gelukt."); setSpotifyConnecting(false); }
   }
 
   async function completeSpotifyLogin(code: string, returnedState: string | null) {
-    const verifier = localStorage.getItem("spotify-verifier"); const savedClient = localStorage.getItem("stem-de-hit-client"); const savedAdmin = localStorage.getItem("stem-de-hit-admin");
+    const verifier = sessionStorage.getItem("spotify-verifier"); const savedClient = sessionStorage.getItem("spotify-login-client"); const savedAdmin = sessionStorage.getItem("spotify-login-admin");
     if (!verifier || !savedClient || !savedAdmin) throw new Error("De Spotify-aanmelding is verlopen. Start opnieuw.");
-    if (!returnedState || returnedState !== localStorage.getItem("spotify-state")) throw new Error("De Spotify-aanmelding kon niet veilig worden bevestigd. Start opnieuw.");
+    if (!returnedState || returnedState !== sessionStorage.getItem("spotify-state")) throw new Error("De Spotify-aanmelding kon niet veilig worden bevestigd. Start opnieuw.");
     const tokenResponse = await fetch("https://accounts.spotify.com/api/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: savedClient, grant_type: "authorization_code", code, redirect_uri: `${location.origin}/?host=1`, code_verifier: verifier }) });
     const tokens = await tokenResponse.json() as Record<string, string | number>; if (!tokenResponse.ok) throw new Error("Spotify kon niet worden gekoppeld. Controleer de Redirect URI.");
-    await jsonFetch("/api/host/setup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode: savedAdmin, clientId: savedClient, ...tokens }) });
-    localStorage.removeItem("spotify-verifier"); localStorage.removeItem("spotify-state");
-    history.replaceState({}, "", "/?host=1"); setNotice("Spotify is gekoppeld."); setConfigured(true); setAdminCode(savedAdmin); await loadDevices(savedAdmin);
+    const result = await jsonFetch("/api/host/setup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode: savedAdmin, clientId: savedClient, ...tokens, newParty: sessionStorage.getItem("spotify-new-party") === "true" }) });
+    sessionStorage.removeItem("spotify-verifier"); sessionStorage.removeItem("spotify-state"); sessionStorage.removeItem("spotify-new-party");
+    sessionStorage.removeItem("spotify-login-client"); sessionStorage.removeItem("spotify-login-admin");
+    history.replaceState({}, "", "/?host=1"); setConfigured(true); setAdminCode(savedAdmin); setChangingSpotify(false); setSpotifyConnecting(false); setShowHost(true); setPlayback({ active: false }); setDevices([]); setSelectedDevice("");
+    await loadDevices(savedAdmin).catch(() => undefined);
+    setNotice(`Spotify is gekoppeld aan ${result.accountName}. Kies je apparaat en zet Auto-DJ aan wanneer je klaar bent.`);
   }
 
   async function loadDevices(code = adminCode) {
@@ -709,14 +731,19 @@ export default function PartyApp() {
           <div className="mb-6 flex items-start justify-between"><div><p className="mb-2 flex items-center gap-2 text-sm font-bold text-[#64f5a4]"><LockKeyhole size={16}/>Alleen voor de host</p><h2 className="text-3xl font-black tracking-tight">Bedien de avond</h2></div><button onClick={() => setShowHost(false)} aria-label="Sluiten"><X/></button></div>
           <div className="mb-5 flex items-center justify-between gap-4 rounded-2xl border border-white/10 bg-white/[.04] p-4"><div><label htmlFor="auto-dj" className="font-bold">Auto-DJ</label><p className="mt-1 text-sm text-zinc-500">Speel automatisch het nummer met de meeste stemmen.</p></div><Switch id="auto-dj" checked={autoDj} onCheckedChange={(next) => { setAutoDj(next); localStorage.setItem("stem-de-hit-auto-dj", String(next)); }}/></div>
           {hostMode && <div className="mb-5 flex items-center justify-between gap-4 rounded-2xl border border-fuchsia-400/20 bg-fuchsia-400/[.07] p-4"><div><label htmlFor="party-mode" className="font-bold text-fuchsia-100">Party Mode</label><p className="mt-1 text-sm text-zinc-500">Grote albumhoes, top drie, animaties en compacte QR-code.</p></div><Switch id="party-mode" checked={partyMode} onCheckedChange={(next) => { setPartyMode(next); setPartyQrOpen(false); localStorage.setItem("stem-de-hit-party-mode", String(next)); }}/></div>}
-          {!configured ? <div className="space-y-4">
+          {!configured || changingSpotify ? <div className="space-y-4">
+            {changingSpotify && <div className="rounded-xl border border-amber-300/30 bg-amber-300/10 p-4 text-sm text-amber-100"><strong>Ander Spotify-account koppelen</strong><p className="mt-2">De bestaande koppeling blijft behouden tot aanmelden lukt. Sluit andere hosttabbladen voordat je wisselt. Auto-DJ wordt op dit scherm uitgezet.</p><p className="mt-2">Kies bij Spotify ‘Niet jij?’ of meld je daar eerst af als het verkeerde account verschijnt.</p></div>}
             <p className="text-sm leading-6 text-zinc-400">Maak in het Spotify Developer Dashboard een app aan en voeg deze exacte Redirect URI toe:</p>
             <code className="block overflow-x-auto rounded-xl bg-black/30 p-3 text-xs text-[#9cfbc4]">{shareUrl}?host=1</code>
             <label className="block text-sm font-semibold">Spotify Client ID<Input value={clientId} onChange={(e) => setClientId(e.target.value)} className="mt-2 h-12 border-white/10 bg-white/[.06]" placeholder="Bijvoorbeeld 1a2b3c…"/></label>
             <label className="block text-sm font-semibold">Beheercode<Input type="password" value={adminCode} onChange={(e) => setAdminCode(e.target.value)} className="mt-2 h-12 border-white/10 bg-white/[.06]" placeholder="De code die je van ons krijgt"/></label>
-            <Button onClick={beginSpotifyLogin} className="h-12 w-full rounded-xl bg-[#64f5a4] font-black text-[#07110d] hover:bg-[#8affba]">Koppel met Spotify</Button>
+            <div className="flex items-start justify-between gap-4 rounded-xl border border-white/10 p-4"><div><label htmlFor="new-spotify-party" className="font-semibold">Begin met een lege muzieksessie</label><p className="mt-1 text-sm text-zinc-400">Na succesvol koppelen worden verzoeken, stemmen en reacties gewist. Gasten moeten opnieuw de feestcode invullen.</p></div><Switch id="new-spotify-party" checked={newSpotifyParty} onCheckedChange={setNewSpotifyParty}/></div>
+            {spotifyConnectError && <p role="alert" className="text-sm text-red-300">{spotifyConnectError}</p>}
+            <Button onClick={() => void beginSpotifyLogin()} disabled={spotifyConnecting} className="h-12 w-full rounded-xl bg-[#64f5a4] font-black text-[#07110d] hover:bg-[#8affba]">{spotifyConnecting ? "Spotify openen…" : "Koppel met Spotify"}</Button>
+            {changingSpotify && <Button variant="outline" disabled={spotifyConnecting} onClick={() => { setChangingSpotify(false); setSpotifyConnectError(""); }} className="w-full border-white/10 bg-white/[.04] text-white">Annuleren</Button>}
           </div> : <div className="space-y-5">
             <div className="rounded-2xl border border-[#64f5a4]/20 bg-[#64f5a4]/10 p-4 text-sm text-[#bcffd7]"><strong className="flex items-center gap-2"><Check size={17}/>Spotify is gekoppeld</strong><p className="mt-1 text-[#8bd7aa]">Laat Spotify spelen op de laptop en kies dat apparaat hieronder.</p></div>
+            <Button variant="outline" onClick={() => { setChangingSpotify(true); setNewSpotifyParty(false); setSpotifyConnectError(""); }} className="w-full border-[#64f5a4]/30 bg-[#64f5a4]/5 text-[#bcffd7] hover:bg-[#64f5a4]/15">Ander Spotify-account koppelen</Button>
             <label className="block text-sm font-semibold">Beheercode<div className="mt-2 flex gap-2"><Input type="password" value={adminCode} onChange={(e) => setAdminCode(e.target.value)} className="h-11 border-white/10 bg-white/[.06]"/><Button onClick={() => loadDevices()} variant="outline" className="h-11 border-white/10 bg-white/[.06] text-white hover:bg-white/10">Ververs</Button></div></label>
             {devices.length > 0 && <div><p className="mb-2 text-sm font-semibold">Spotify-apparaat</p><div className="grid gap-2">{devices.map((device) => <button key={device.id} onClick={() => setSelectedDevice(device.id)} className={`flex items-center justify-between rounded-xl border p-3 text-left ${selectedDevice === device.id ? "border-[#64f5a4] bg-[#64f5a4]/10" : "border-white/10 bg-white/[.04]"}`}><span><strong className="block">{device.name}</strong><span className="text-xs text-zinc-500">{device.type}</span></span>{device.is_active && <span className="text-xs font-bold text-[#64f5a4]">Actief</span>}</button>)}</div></div>}
             <AlertDialog><AlertDialogTrigger asChild><Button variant="outline" className="w-full rounded-xl border-red-400/25 bg-red-400/5 text-red-200 hover:bg-red-400/15 hover:text-red-100"><RotateCcw size={16}/>Nieuwe sessie</Button></AlertDialogTrigger><AlertDialogContent className="border-white/10 bg-[#101914] text-white"><AlertDialogHeader><AlertDialogTitle>Nieuwe muzieksessie starten?</AlertDialogTitle><AlertDialogDescription className="text-zinc-400">Alle oude verzoeken en stemmen worden definitief gewist. De Spotify-koppeling blijft bewaard.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel className="border-white/10 bg-white/[.04] text-white hover:bg-white/10 hover:text-white">Annuleren</AlertDialogCancel><AlertDialogAction onClick={() => void startNewParty()} disabled={busyId === -3} className="bg-red-500 font-bold text-white hover:bg-red-400">Wis lijst en start opnieuw</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>

@@ -1,5 +1,6 @@
-import { extendDeadline, getSetting, setSettings } from "@/db/repository";
+import { extendDeadline, getSetting } from "@/db/repository";
 import { decryptSetting, encryptSetting } from "@/lib/secure-settings";
+import { saveRefreshedSpotifyTokens } from "@/lib/spotify-connection";
 
 export function assertAdmin(code: string | null | undefined) { const expected = process.env.ADMIN_CODE; if (!expected || !code || code !== expected) throw new Error("De beheercode klopt niet."); }
 let tokenRefresh: Promise<string> | null = null;
@@ -7,21 +8,22 @@ export class SpotifyError extends Error {
   constructor(message: string, public status = 503, public retryAfter = 5, public reason = "") { super(message); }
 }
 
-async function refreshSpotifyToken(refreshToken: string, clientId: string) {
+async function refreshSpotifyToken(refreshToken: string, clientId: string, connectionId: string) {
   const response = await fetch("https://accounts.spotify.com/api/token", { method: "POST", signal: AbortSignal.timeout(8000), headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId }) });
   const data = await response.json() as { access_token?: string; refresh_token?: string; expires_in?: number; error_description?: string };
   if (!response.ok || !data.access_token) throw new Error(data.error_description || "Spotify moet opnieuw worden gekoppeld.");
   const [encryptedAccessToken, encryptedRefreshToken] = await Promise.all([encryptSetting(data.access_token), encryptSetting(data.refresh_token || refreshToken)]);
-  await setSettings({ spotify_access_token: encryptedAccessToken, spotify_refresh_token: encryptedRefreshToken, spotify_expires_at: String(Date.now() + (data.expires_in || 3600) * 1000) });
+  await saveRefreshedSpotifyTokens({ spotify_access_token: encryptedAccessToken, spotify_refresh_token: encryptedRefreshToken, spotify_expires_at: String(Date.now() + (data.expires_in || 3600) * 1000) }, connectionId);
   return data.access_token;
 }
 
 export async function spotifyToken(forceRefresh = false) {
+  const connectionId = await getSetting("spotify_connection_id") || "";
   const [storedAccessToken, storedRefreshToken, clientId, expiresAt] = await Promise.all([getSetting("spotify_access_token"), getSetting("spotify_refresh_token"), getSetting("spotify_client_id"), getSetting("spotify_expires_at")]);
   const [accessToken, refreshToken] = await Promise.all([decryptSetting(storedAccessToken), decryptSetting(storedRefreshToken)]);
   if (!refreshToken || !clientId) throw new Error("Spotify is nog niet gekoppeld.");
   if (!forceRefresh && accessToken && Number(expiresAt || 0) > Date.now() + 60_000) return accessToken;
-  if (!tokenRefresh) tokenRefresh = refreshSpotifyToken(refreshToken, clientId);
+  if (!tokenRefresh) tokenRefresh = refreshSpotifyToken(refreshToken, clientId, connectionId);
   try { return await tokenRefresh; }
   finally { tokenRefresh = null; }
 }

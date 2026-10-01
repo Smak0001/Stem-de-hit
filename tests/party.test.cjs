@@ -13,6 +13,9 @@ function modules(overrides = {}, globals = {}) {
   const cache = new Map();
   function load(name) {
     if (name in overrides) return overrides[name];
+    // Connection persistence has its own SQLite integration suite. These playback
+    // fixtures use existing tokens and must not unexpectedly refresh credentials.
+    if (name === '@/lib/spotify-connection') return { saveRefreshedSpotifyTokens: async () => { throw Error('Unexpected credential refresh in playback fixture'); } };
     if (!name.startsWith('@/')) return require(name);
     const file = path.join(root, name.slice(2)) + (fs.existsSync(path.join(root, name.slice(2)) + '.ts') ? '.ts' : '.tsx');
     if (cache.has(file)) return cache.get(file);
