@@ -7,11 +7,14 @@ import { Input } from "@/components/ui/input";
 import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
 import { Switch } from "@/components/ui/switch";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
+import { ACCESS_EXPIRED, ApiError, jsonFetch, resetClientSession } from "@/lib/client-api";
+import { autoDjDecision, type EndObservation } from "@/lib/auto-dj";
+import { PartyRanking } from "@/components/party-ranking";
 
 type Track = { id: number; spotifyId: string; uri: string; name: string; artist: string; album: string; imageUrl: string | null; durationMs: number; votes: number; hasVoted: boolean; status: string };
 type SearchTrack = Omit<Track, "id" | "votes" | "hasVoted" | "status">;
 type Device = { id: string; name: string; type: string; is_active: boolean };
-type Playback = { active: boolean; isPlaying?: boolean; progressMs?: number; item?: SearchTrack; queue?: SearchTrack[]; device?: { id: string; name: string; type: string } | null };
+type Playback = { active: boolean; stale?: boolean; sampledAt?: number; error?: string; hasManagedTail?: boolean; isPlaying?: boolean; progressMs?: number; item?: SearchTrack; queue?: SearchTrack[]; device?: { id: string; name: string; type: string } | null };
 type ReactionEvent = { id: number; emoji: string; createdAt: number };
 type ReactionParticle = ReactionEvent & { x: number; drift: number; rotation: number };
 type ReactionCombo = { id: number; emoji: string | null; count: number };
@@ -34,15 +37,6 @@ const getVoterId = () => {
   let value = localStorage.getItem("stem-de-hit-voter");
   if (!value) { value = crypto.randomUUID(); localStorage.setItem("stem-de-hit-voter", value); }
   return value;
-};
-
-// API responses are validated at their route boundary; callers consume the route-specific shape.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const jsonFetch = async (url: string, options?: RequestInit): Promise<any> => {
-  const response = await fetch(url, options);
-  const data = await response.json().catch(() => ({})) as { error?: string } & Record<string, unknown>;
-  if (!response.ok) throw new Error(data.error || "Er ging iets mis. Probeer het opnieuw.");
-  return data;
 };
 
 function formatDuration(ms: number) {
@@ -211,6 +205,7 @@ export default function PartyApp() {
   const [searching, setSearching] = useState(false);
   const [configured, setConfigured] = useState(false);
   const [notice, setNotice] = useState("");
+  const [playerError, setPlayerError] = useState("");
   const [hostMode, setHostMode] = useState(false);
   const [appReady, setAppReady] = useState(false);
   const [joined, setJoined] = useState(false);
@@ -241,8 +236,10 @@ export default function PartyApp() {
   const triggeredFor = useRef("");
   const lastPlaybackId = useRef<string | null>(null);
   const autoDjBusy = useRef(false);
-  const inactivePolls = useRef(0);
-  const expectedPlayback = useRef<{ spotifyId: string; itemId: number; until: number; normalizeOnStart: boolean } | null>(null);
+  const previousPlayback = useRef<EndObservation | null>(null);
+  const autoDjRetryAt = useRef(0);
+  const commandForTrack = useRef<{ uri: string; id: string } | null>(null);
+  const preparedFor = useRef("");
   const previousLeaderId = useRef<number | null>(null);
   const previousPartyPlaybackId = useRef<string | null>(null);
   const milestoneVotes = useRef(new Map<number, number>());
@@ -265,6 +262,19 @@ export default function PartyApp() {
   }, [adminCode, hostMode]);
 
   useEffect(() => {
+    const expired = () => {
+      if (hostMode) { setNotice("De beheercode is niet meer geldig. Open de hostinstellingen."); return; }
+      setJoined(false); setJoinCode(""); setJoinError("Deze sessie is afgelopen. Vul de nieuwe code van de tv in.");
+      setTracks([]); setResults([]); setVoterCount(0); setPlayback({ active: false });
+      pendingReactions.current = [];
+      if (reactionFlushTimer.current) clearTimeout(reactionFlushTimer.current);
+      reactionFlushTimer.current = null;
+    };
+    window.addEventListener(ACCESS_EXPIRED, expired);
+    return () => window.removeEventListener(ACCESS_EXPIRED, expired);
+  }, [hostMode]);
+
+  useEffect(() => {
     const isHost = new URLSearchParams(location.search).get("host") === "1";
     setHostMode(isHost);
     setShareUrl(`${location.origin}/`);
@@ -277,18 +287,32 @@ export default function PartyApp() {
 
   useEffect(() => {
     if (!appReady || (!hostMode && !joined) || (hostMode && !adminCode)) return;
-    void refresh().catch((error) => setNotice(error.message));
-    const timer = setInterval(() => void refresh().catch(() => undefined), 1000);
-    return () => clearInterval(timer);
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try { await refresh(); } catch (error) { if (!stopped) setNotice(error instanceof Error ? error.message : "De verzoeklijst is tijdelijk niet bereikbaar."); }
+      if (!stopped) timer = setTimeout(poll, 1000);
+    };
+    void poll();
+    return () => { stopped = true; clearTimeout(timer); };
   }, [adminCode, appReady, hostMode, joined, refresh]);
 
   useEffect(() => {
     if (!appReady || (!hostMode && !joined) || (hostMode && !adminCode)) return;
     const adminQuery = hostMode && adminCode ? `?adminCode=${encodeURIComponent(adminCode)}` : "";
-    const loadPlayback = () => void jsonFetch(`/api/playback${adminQuery}`, { cache: "no-store" }).then(setPlayback).catch(() => setPlayback({ active: false }));
-    loadPlayback();
-    const timer = setInterval(loadPlayback, 1000);
-    return () => clearInterval(timer);
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const loadPlayback = async () => {
+      let delay = 1000;
+      try { const data = await jsonFetch(`/api/playback${adminQuery}`, { cache: "no-store" }); if (!stopped) setPlayback(data); }
+      catch (error) {
+        if (!stopped && !(error instanceof ApiError && error.status === 401)) setPlayback(old => ({ ...old, stale: true, error: error instanceof Error ? error.message : "Spotify is tijdelijk niet bereikbaar." }));
+        if (error instanceof ApiError) delay = Math.max(delay, error.retryAfter * 1000);
+      }
+      if (!stopped) timer = setTimeout(loadPlayback, delay);
+    };
+    void loadPlayback();
+    return () => { stopped = true; clearTimeout(timer); };
   }, [adminCode, appReady, configured, hostMode, joined]);
 
   useEffect(() => {
@@ -452,54 +476,19 @@ export default function PartyApp() {
 
   useEffect(() => {
     if (!hostMode || !autoDj || !autoDjLeader || !adminCode) return;
-    if (!playback.active || !playback.item) {
-      const inactiveCount = ++inactivePolls.current;
-      const expected = expectedPlayback.current;
-      if (expected && lastPlaybackId.current && inactiveCount >= 2 && !autoDjBusy.current) {
-        expectedPlayback.current = null;
-        triggeredFor.current = "";
-        void playNext(expected.itemId, true, true, true);
-        return;
-      }
-      if (topTrack && lastPlaybackId.current && inactiveCount >= 2 && triggeredFor.current !== lastPlaybackId.current && !autoDjBusy.current) {
-        triggeredFor.current = lastPlaybackId.current;
-        void playNext(undefined, true);
-      }
-      return;
+    const remaining = playback.item ? playback.item.durationMs - Number(playback.progressMs || 0) : 0;
+    if (topTrack && playback.active && !playback.stale && playback.item && playback.isPlaying && remaining > 5000 && remaining <= 15_000 && preparedFor.current !== playback.item.uri && !autoDjBusy.current) {
+      preparedFor.current = playback.item.uri;
+      // Warm the full source without reserving a winner or modifying Spotify.
+      void jsonFetch("/api/host/play-next", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode, prepare: true }) }).catch(error => setPlayerError(error.message));
     }
-    inactivePolls.current = 0;
-    const currentId = playback.item.spotifyId;
-    if (expectedPlayback.current) {
-      if (currentId === expectedPlayback.current.spotifyId) {
-        const expected = expectedPlayback.current;
-        expectedPlayback.current = null;
-        lastPlaybackId.current = currentId;
-        if (expected.normalizeOnStart && !autoDjBusy.current) void playNext(expected.itemId, true, true, true);
-        return;
-      }
-      const changedBeforeWinner = lastPlaybackId.current !== null && lastPlaybackId.current !== currentId;
-      if (changedBeforeWinner && !autoDjBusy.current) {
-        const expected = expectedPlayback.current;
-        expectedPlayback.current = null;
-        triggeredFor.current = "";
-        lastPlaybackId.current = currentId;
-        void playNext(expected.itemId, true, true, true);
-        return;
-      }
-      else if (Date.now() < expectedPlayback.current.until) { lastPlaybackId.current = currentId; return; }
-      else expectedPlayback.current = null;
+    const decision = autoDjDecision(playback, previousPlayback.current, Date.now(), Boolean(topTrack));
+    previousPlayback.current = decision.observation;
+    if (decision.afterTrack && triggeredFor.current !== decision.afterTrack && !autoDjBusy.current && Date.now() >= autoDjRetryAt.current) {
+      triggeredFor.current = decision.afterTrack;
+      if (commandForTrack.current?.uri !== decision.afterTrack) commandForTrack.current = { uri: decision.afterTrack, id: crypto.randomUUID() };
+      void playNext(undefined, true, decision.afterTrack);
     }
-    if (!topTrack) { lastPlaybackId.current = currentId; return; }
-    const changedNaturally = lastPlaybackId.current !== null && lastPlaybackId.current !== currentId;
-    const remaining = playback.item.durationMs - Number(playback.progressMs || 0);
-    const readyToQueue = Boolean(playback.isPlaying) && remaining > 0 && remaining <= 12_000;
-    const finishedWithoutNextTrack = !playback.isPlaying && remaining >= 0 && remaining <= 3000;
-    lastPlaybackId.current = currentId;
-    if ((readyToQueue || changedNaturally || finishedWithoutNextTrack) && triggeredFor.current !== currentId && !autoDjBusy.current) {
-      triggeredFor.current = currentId;
-      void playNext(undefined, true, !readyToQueue);
-    }
-  // Auto-DJ reacts to a real Spotify track transition or to playback ending without a next track.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playback, hostMode, autoDj, autoDjLeader, adminCode, topTrack?.id, tracks]);
 
@@ -558,7 +547,7 @@ export default function PartyApp() {
     const challenge = btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
     const state = crypto.randomUUID(); localStorage.setItem("spotify-state", state);
     const auth = new URL("https://accounts.spotify.com/authorize");
-    auth.search = new URLSearchParams({ client_id: clientId.trim(), response_type: "code", redirect_uri: `${location.origin}/?host=1`, scope: "user-read-playback-state user-read-currently-playing user-modify-playback-state", code_challenge_method: "S256", code_challenge: challenge, state }).toString();
+    auth.search = new URLSearchParams({ client_id: clientId.trim(), response_type: "code", redirect_uri: `${location.origin}/?host=1`, scope: "user-read-playback-state user-read-currently-playing user-modify-playback-state playlist-read-private playlist-read-collaborative", code_challenge_method: "S256", code_challenge: challenge, state }).toString();
     location.href = auth.toString();
   }
 
@@ -579,25 +568,32 @@ export default function PartyApp() {
     setDevices(data.devices); setSelectedDevice(data.devices.find((device: Device) => device.is_active)?.id || data.devices[0]?.id || ""); setNotice("");
   }
 
-  async function playNext(itemId?: number, automatic = false, immediate = true, recover = false) {
+  async function playNext(itemId?: number, automatic = false, afterTrack?: string) {
+    if (autoDjBusy.current) return;
     setBusyId(itemId ?? -2);
-    if (automatic) autoDjBusy.current = true;
+    autoDjBusy.current = true;
     try {
-      const data = await jsonFetch("/api/host/play-next", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode, itemId, deviceId: selectedDevice || undefined, immediate, recover }) });
-      expectedPlayback.current = { spotifyId: data.spotifyId, itemId: data.itemId, until: Date.now() + (immediate ? 10_000 : 20_000), normalizeOnStart: Boolean(data.normalizeOnStart) };
-      setNotice(automatic && !immediate ? `${data.name} staat klaar als volgende.` : automatic ? `${data.name} is als winnaar gestart.` : `${data.name} speelt nu op Spotify.`);
+      const data = await jsonFetch("/api/host/play-next", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode, itemId, deviceId: selectedDevice || undefined, automatic, afterTrack, commandId: automatic ? commandForTrack.current?.id : crypto.randomUUID() }) });
+      if (data.waiting) { triggeredFor.current = ""; return; }
+      setPlayerError("");
+      if (data.played) { previousPlayback.current = null; setNotice(`${data.name} speelt nu op Spotify.`); }
       await refresh();
       const latest = await jsonFetch(`/api/playback?adminCode=${encodeURIComponent(adminCode)}`, { cache: "no-store" }).catch(() => null);
       if (latest?.item?.spotifyId) lastPlaybackId.current = latest.item.spotifyId;
       if (latest) setPlayback(latest);
     }
-    catch (error) { if (automatic) triggeredFor.current = ""; setNotice(error instanceof Error ? error.message : "Afspelen op Spotify lukte niet."); }
+    catch (error) { if (automatic) { triggeredFor.current = ""; autoDjRetryAt.current = Date.now() + Math.max(5000, error instanceof ApiError ? error.retryAfter * 1000 : 0); } const message = error instanceof Error ? error.message : "Afspelen op Spotify lukte niet."; setNotice(message); setPlayerError(message); }
     finally { setBusyId(null); autoDjBusy.current = false; }
   }
 
   async function startNewParty() {
     setBusyId(-3); setNotice("");
-    try { await jsonFetch("/api/host/reset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode }) }); setTracks([]); setResults([]); setQuery(""); triggeredFor.current = ""; setNotice("Nieuwe sessie gestart. De oude verzoeken en stemmen zijn gewist."); await refresh(); }
+    try {
+      await jsonFetch("/api/host/reset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode }) });
+      resetClientSession(); setTracks([]); setResults([]); setQuery(""); setPlayerError("");
+      triggeredFor.current = ""; previousPlayback.current = null; commandForTrack.current = null; lastPlaybackId.current = null; autoDjRetryAt.current = 0; preparedFor.current = "";
+      setNotice("Nieuwe sessie gestart. De oude verzoeken en stemmen zijn gewist. Gasten voeren de nieuwe tv-code in."); await refresh();
+    }
     catch (error) { setNotice(error instanceof Error ? error.message : "Nieuwe sessie starten lukte niet."); }
     finally { setBusyId(null); }
   }
@@ -608,7 +604,7 @@ export default function PartyApp() {
     setJoining(true); setJoinError("");
     try {
       await jsonFetch("/api/join", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: joinCode }) });
-      setJoined(true); setJoinCode("");
+      resetClientSession(); setJoined(true); setJoinCode("");
     } catch (error) {
       setJoinError(error instanceof Error ? error.message : "De code klopt niet.");
     } finally {
@@ -643,6 +639,7 @@ export default function PartyApp() {
 
   return (
     <main className={`${hostMode ? "h-[100dvh] overflow-hidden" : "min-h-screen w-full max-w-full overflow-x-hidden"} bg-[radial-gradient(circle_at_75%_5%,rgba(81,255,168,.13),transparent_28%),linear-gradient(145deg,#07110d_0%,#0d1813_52%,#050907_100%)] text-white`}>
+      {(playback.stale || playerError) && <div role="status" className="fixed bottom-3 left-3 right-3 z-[100] rounded-xl border border-amber-300/30 bg-zinc-950/95 px-4 py-3 text-center text-sm text-amber-200">{playerError || playback.error || "Spotify is tijdelijk niet bereikbaar. Laatst bekende nummer getoond; Auto-DJ wacht."}</div>}
       <header className={`mx-auto flex min-w-0 max-w-7xl items-center justify-between px-3 min-[360px]:px-4 sm:px-8 ${hostMode ? "h-16" : "py-4 sm:py-5"}`}>
         <a href="/" className="flex items-center gap-3 font-black tracking-tight"><span className="grid h-10 w-10 place-items-center rounded-2xl bg-[#64f5a4] text-[#07110d] shadow-[0_0_28px_rgba(100,245,164,.28)]"><Music2 size={21}/></span><span className="text-xl">Stem de Hit</span></a>
         <div className="flex items-center gap-2">{hostMode && <span className={`hidden rounded-full px-3 py-1 text-xs font-black sm:block ${autoDj ? "bg-[#64f5a4]/15 text-[#64f5a4]" : "bg-white/10 text-zinc-500"}`}>Auto-DJ {autoDj ? "aan" : "uit"}</span>}<Button variant="ghost" className="rounded-full text-zinc-300 hover:bg-white/10 hover:text-white" onClick={() => setShowHost(!showHost)}><Settings2 size={17}/><span className="hidden sm:inline">Hostinstellingen</span></Button></div>
@@ -698,7 +695,7 @@ export default function PartyApp() {
               {playback.active && playback.item ? <div className="grid min-h-0 w-full items-center gap-7 lg:grid-cols-[minmax(260px,.9fr)_minmax(0,1.1fr)]"><div className="grid min-h-0 place-items-center">{playback.item.imageUrl ? <img src={playback.item.imageUrl} alt="Albumhoes" className="party-album-pulse aspect-square max-h-[62vh] w-full max-w-[min(58vh,34rem)] rounded-[28px] object-contain shadow-[0_32px_90px_rgba(0,0,0,.65)]"/> : <span className="party-album-pulse grid aspect-square w-full max-w-[min(58vh,34rem)] place-items-center rounded-[28px] bg-white/10"><Music2 size={70}/></span>}</div><div className="min-w-0"><span className="mb-5 inline-flex items-center gap-2 rounded-full bg-[#64f5a4] px-4 py-2 text-xs font-black uppercase tracking-[.16em] text-[#07110d]"><Volume2 size={15}/>Nu speelt</span><h1 className="line-clamp-2 text-5xl font-black leading-[.92] tracking-[-.055em] xl:text-7xl">{playback.item.name}</h1><p className="mt-4 truncate text-2xl font-semibold text-zinc-400 xl:text-3xl">{playback.item.artist}</p><div className="mt-8"><div className="mb-2 flex justify-between text-sm font-bold text-zinc-500"><span>{formatDuration(playback.progressMs || 0)}</span><span>{formatDuration(playback.item.durationMs)}</span></div><div className="h-2.5 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-fuchsia-400 to-[#64f5a4] transition-all duration-700" style={{ width: `${Math.min(100, Math.max(0, ((playback.progressMs || 0) / Math.max(1, playback.item.durationMs)) * 100))}%` }}/></div></div><div className="mt-7 flex h-12 items-end gap-2" aria-hidden="true">{[42,72,54,92,64,38,80,58,96,48,70,40].map((height, index) => <span key={index} className="w-2 animate-pulse rounded-full bg-gradient-to-t from-fuchsia-500 to-[#64f5a4]" style={{ height: `${height}%`, animationDelay: `${index * 90}ms` }}/>)}</div></div></div> : <div className="m-auto text-center"><span className="mx-auto grid h-24 w-24 place-items-center rounded-[30px] bg-white/[.06] text-zinc-600"><Headphones size={48}/></span><h1 className="mt-6 text-4xl font-black">Start Spotify op de laptop</h1><p className="mt-2 text-lg text-zinc-500">Party Mode springt vanzelf aan zodra de muziek speelt.</p></div>}
             </div>
 
-            <aside className="flex min-h-0 flex-col gap-4"><div className="min-h-0 flex-1 overflow-hidden rounded-[28px] border border-white/10 bg-white/[.045] p-5"><div className="mb-4 flex items-center justify-between"><div><p className="text-xs font-black uppercase tracking-[.18em] text-[#64f5a4]">Live ranglijst</p><h2 className="mt-1 text-2xl font-black">Hierna</h2></div><span className="rounded-full bg-white/[.06] px-3 py-1.5 text-sm font-bold text-zinc-400">Top 5</span></div><div className="grid gap-3">{candidateTracks.slice(0, 5).map((track, index) => <div key={track.id} className={`flex items-center gap-3 rounded-2xl border p-3 ${index === 0 ? "border-[#64f5a4]/30 bg-[#64f5a4]/10" : "border-white/[.06] bg-white/[.035]"} ${voteFlashId === track.id ? "party-vote-flash" : ""}`}><span className={`grid h-8 w-8 shrink-0 place-items-center rounded-xl text-sm font-black ${index === 0 ? "bg-[#64f5a4] text-[#07110d]" : "bg-white/10 text-zinc-400"}`}>{index + 1}</span>{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-12 w-12 shrink-0 rounded-xl object-cover"/> : <span className="grid h-12 w-12 shrink-0 place-items-center rounded-xl bg-white/10"><Music2 size={18}/></span>}<div className="min-w-0 flex-1"><h3 className="truncate font-black">{track.name}</h3><p className="truncate text-sm text-zinc-500">{track.artist}</p></div><span className="flex items-center gap-1 rounded-xl bg-black/20 px-2.5 py-2 text-sm font-black text-[#64f5a4]"><ChevronUp size={15}/>{track.votes}</span></div>)}{candidateTracks.length === 0 && playback.queue?.slice(0, 5).map((track, index) => <div key={`${track.spotifyId}-${index}`} className="flex items-center gap-3 rounded-2xl border border-white/[.06] bg-white/[.035] p-3"><span className="grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-white/10 text-sm font-black text-zinc-500">{index + 1}</span>{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-12 w-12 shrink-0 rounded-xl object-cover"/> : <span className="grid h-12 w-12 shrink-0 place-items-center rounded-xl bg-white/10"><Music2 size={18}/></span>}<div className="min-w-0"><h3 className="truncate font-bold">{track.name}</h3><p className="truncate text-sm text-zinc-500">{track.artist}</p></div></div>)}{candidateTracks.length === 0 && !playback.queue?.length && <div className="grid min-h-40 place-items-center rounded-2xl border border-dashed border-white/10 text-center text-zinc-600"><div><Music2 className="mx-auto mb-2"/><p>Nog geen nummers klaar</p></div></div>}</div></div>
+            <aside className="flex min-h-0 flex-col gap-4"><PartyRanking candidates={candidateTracks} queue={spotifyQueueTracks} flashId={voteFlashId}/>
               <button onClick={() => setPartyQrOpen(true)} className="flex shrink-0 items-center gap-4 rounded-[24px] border border-[#64f5a4]/20 bg-[#64f5a4]/10 p-4 text-left transition hover:bg-[#64f5a4]/15"><div className="grid h-20 w-20 shrink-0 place-items-center overflow-hidden rounded-xl bg-white p-1.5">{shareUrl ? <img src={`https://quickchart.io/qr?text=${encodeURIComponent(shareUrl)}&size=160&margin=1`} alt="QR-code" className="h-full w-full"/> : <QrCode className="text-[#07110d]"/>}</div><div className="min-w-0 flex-1"><p className="font-black text-[#baffd4]">Nog iemand laten stemmen?</p>{partyAccess ? <p className="mt-1 font-mono text-lg font-black tracking-[.15em] text-white">{partyAccess.code}</p> : <p className="mt-1 text-sm text-[#79ba96]">Klik om de QR-code groot te tonen</p>}</div><QrCode className="shrink-0 text-[#64f5a4]"/></button></aside>
           </div>
         </div>
