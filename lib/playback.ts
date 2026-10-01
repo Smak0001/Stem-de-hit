@@ -3,7 +3,7 @@ import { SpotifyError, spotifyFetch } from "@/lib/spotify";
 
 export type SpotifyTrack = { id?: string; uri?: string; name?: string; duration_ms?: number; is_local?: boolean; is_playable?: boolean; artists?: Array<{ name?: string }>; album?: { name?: string; images?: Array<{ url?: string }> } };
 export type SpotifyPlayback = { is_playing?: boolean; progress_ms?: number; timestamp?: number; shuffle_state?: boolean; context?: { uri?: string } | null; device?: { id?: string; name?: string; type?: string }; item?: SpotifyTrack };
-export type PlaybackSnapshot = { playback: SpotifyPlayback | null; queue: SpotifyTrack[]; sampledAt: number; retryAt: number; stale: boolean; error?: string };
+export type PlaybackSnapshot = { playback: SpotifyPlayback | null; queue: SpotifyTrack[]; sampledAt: number; retryAt: number; stale: boolean; refreshing?: boolean; error?: string };
 const KEY = "spotify_playback_cache_v2";
 let pending: Promise<PlaybackSnapshot> | null = null;
 
@@ -17,7 +17,7 @@ async function loadSnapshot(): Promise<PlaybackSnapshot> {
   if (cached && cached.retryAt > Date.now()) return cached;
   const owner = crypto.randomUUID();
   if (!await acquireLease("lock:playback-cache", owner, 25_000)) {
-    if (cached) return { ...cached, stale: true };
+    if (cached) return { ...cached, stale: true, refreshing: !cached.error && Date.now() - cached.sampledAt <= 5000 };
     throw new SpotifyError("Spotify-status wordt opgehaald. Even geduld.", 503, 1);
   }
   try {

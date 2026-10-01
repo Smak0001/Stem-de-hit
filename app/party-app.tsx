@@ -10,11 +10,12 @@ import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, 
 import { ACCESS_EXPIRED, ApiError, jsonFetch, resetClientSession } from "@/lib/client-api";
 import { autoDjDecision, type EndObservation } from "@/lib/auto-dj";
 import { PartyRanking } from "@/components/party-ranking";
+import { playbackWarning } from "@/lib/playback-status";
 
 type Track = { id: number; spotifyId: string; uri: string; name: string; artist: string; album: string; imageUrl: string | null; durationMs: number; votes: number; hasVoted: boolean; status: string };
 type SearchTrack = Omit<Track, "id" | "votes" | "hasVoted" | "status">;
 type Device = { id: string; name: string; type: string; is_active: boolean };
-type Playback = { active: boolean; stale?: boolean; sampledAt?: number; error?: string; hasManagedTail?: boolean; isPlaying?: boolean; progressMs?: number; item?: SearchTrack; queue?: SearchTrack[]; device?: { id: string; name: string; type: string } | null };
+type Playback = { active: boolean; stale?: boolean; refreshing?: boolean; sampledAt?: number; error?: string; hasManagedTail?: boolean; isPlaying?: boolean; progressMs?: number; item?: SearchTrack; queue?: SearchTrack[]; device?: { id: string; name: string; type: string } | null };
 type ReactionEvent = { id: number; emoji: string; createdAt: number };
 type ReactionParticle = ReactionEvent & { x: number; drift: number; rotation: number };
 type ReactionCombo = { id: number; emoji: string | null; count: number };
@@ -312,7 +313,7 @@ export default function PartyApp() {
       let delay = 1000;
       try { const data = await jsonFetch(`/api/playback${adminQuery}`, { cache: "no-store" }); if (!stopped) setPlayback(data); }
       catch (error) {
-        if (!stopped && !(error instanceof ApiError && error.status === 401)) setPlayback(old => ({ ...old, stale: true, error: error instanceof Error ? error.message : "Spotify is tijdelijk niet bereikbaar." }));
+        if (!stopped && !(error instanceof ApiError && error.status === 401)) setPlayback(old => ({ ...old, stale: true, refreshing: false, error: error instanceof Error ? error.message : "De Spotify-status kon niet worden opgehaald. Auto-DJ wacht." }));
         if (error instanceof ApiError) delay = Math.max(delay, error.retryAfter * 1000);
       }
       if (!stopped) timer = setTimeout(loadPlayback, delay);
@@ -491,7 +492,10 @@ export default function PartyApp() {
     if (topTrack && playback.active && !playback.stale && playback.item && playback.isPlaying && remaining > 5000 && remaining <= 15_000 && preparedFor.current !== playback.item.uri && !autoDjBusy.current) {
       preparedFor.current = playback.item.uri;
       // Warm the full source without reserving a winner or modifying Spotify.
-      void jsonFetch("/api/host/play-next", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode, prepare: true }) }).catch(error => setPlayerError(error.message));
+      // This is optional preloading, not a playback command. Transient lock/status
+      // failures must not leave a permanent player error after polling recovers.
+      // The actual transition validates again and still reports any failure.
+      void jsonFetch("/api/host/play-next", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode, prepare: true }) }).catch(() => undefined);
     }
     const decision = autoDjDecision(playback, previousPlayback.current, Date.now(), Boolean(topTrack));
     previousPlayback.current = decision.observation;
@@ -661,7 +665,7 @@ export default function PartyApp() {
 
   return (
     <main className={`${hostMode ? "h-[100dvh] overflow-hidden" : "min-h-screen w-full max-w-full overflow-x-hidden"} bg-[radial-gradient(circle_at_75%_5%,rgba(81,255,168,.13),transparent_28%),linear-gradient(145deg,#07110d_0%,#0d1813_52%,#050907_100%)] text-white`}>
-      {(playback.stale || playerError) && <div role="status" className="fixed bottom-3 left-3 right-3 z-[100] rounded-xl border border-amber-300/30 bg-zinc-950/95 px-4 py-3 text-center text-sm text-amber-200">{playerError || playback.error || "Spotify is tijdelijk niet bereikbaar. Laatst bekende nummer getoond; Auto-DJ wacht."}</div>}
+      {(playbackWarning(playback) || playerError) && <div role="status" className="fixed bottom-3 left-3 right-3 z-[100] rounded-xl border border-amber-300/30 bg-zinc-950/95 px-4 py-3 text-center text-sm text-amber-200">{playerError || playbackWarning(playback)}</div>}
       <header className={`mx-auto flex min-w-0 max-w-7xl items-center justify-between px-3 min-[360px]:px-4 sm:px-8 ${hostMode ? "h-16" : "py-4 sm:py-5"}`}>
         <a href="/" className="flex items-center gap-3 font-black tracking-tight"><span className="grid h-10 w-10 place-items-center rounded-2xl bg-[#64f5a4] text-[#07110d] shadow-[0_0_28px_rgba(100,245,164,.28)]"><Music2 size={21}/></span><span className="text-xl">Stem de Hit</span></a>
         <div className="flex items-center gap-2">{hostMode && <span className={`hidden rounded-full px-3 py-1 text-xs font-black sm:block ${autoDj ? "bg-[#64f5a4]/15 text-[#64f5a4]" : "bg-white/10 text-zinc-500"}`}>Auto-DJ {autoDj ? "aan" : "uit"}</span>}<Button variant="ghost" className="rounded-full text-zinc-300 hover:bg-white/10 hover:text-white" onClick={() => setShowHost(!showHost)}><Settings2 size={17}/><span className="hidden sm:inline">Hostinstellingen</span></Button></div>

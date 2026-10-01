@@ -174,6 +174,39 @@ test('429 Retry-After is shared and blocks further Spotify calls', async () => {
   assert.equal(calls,1); s.close();
 });
 
+test('another Worker refreshing a recent sample is quiet but still blocks Auto-DJ', async () => {
+  const s=storage(); const now=Date.now();
+  const cached={playback:{item:track('A'),device:{id:'laptop'},is_playing:true,progress_ms:179900},queue:[track('B')],sampledAt:now-1200,retryAt:0,stale:false};
+  await s.repo.setSettings({spotify_playback_cache_v2:JSON.stringify(cached)});
+  await s.repo.acquireLease('lock:playback-cache','other-worker',25000);
+  const load=modules({'@/db/repository':s.repo,'@/lib/spotify':{SpotifyError,spotifyFetch:async()=>{throw Error('Must not fetch while another worker owns the lease');}}});
+  const snapshot=await load('@/lib/playback').getPlaybackSnapshot();
+  assert.equal(snapshot.stale,true); assert.equal(snapshot.refreshing,true);
+  assert.equal(load('@/lib/playback-status').playbackWarning(snapshot,now),'');
+  await assert.rejects(load('@/lib/party-queue').requireFreshPlayback(),/actuele/);
+  const api=modules({'@/lib/party-access':{hasPartyAccess:async()=>true},'@/lib/playback':{getPlaybackSnapshot:async()=>snapshot,mapTrack:t=>t},'@/lib/party-queue':{getQueuePlan:async()=>null,planPosition:()=>-1},'@/lib/spotify':{apiError:e=>{throw e;}}});
+  const result=await api('@/app/api/playback/route').GET(new Request('https://test/api/playback'));
+  const data=await result.json(); assert.equal(data.refreshing,true); assert.equal(data.stale,true);
+  await s.repo.releaseLease('lock:playback-cache','other-worker'); s.close();
+});
+
+test('slow refresh and genuine errors remain visible; fresh status clears the warning', async () => {
+  const s=storage(); const now=Date.now();
+  const load=modules({'@/db/repository':s.repo,'@/lib/spotify':{SpotifyError}});
+  const warning=load('@/lib/playback-status').playbackWarning;
+  await s.repo.acquireLease('lock:playback-cache','other-worker',25000);
+  await s.repo.setSettings({spotify_playback_cache_v2:JSON.stringify({playback:null,queue:[],sampledAt:now-6000,retryAt:0,stale:false})});
+  const slow=await load('@/lib/playback').getPlaybackSnapshot();
+  assert.equal(slow.refreshing,false); assert.match(warning(slow,now),/vertraagd/);
+  assert.match(warning({stale:true,refreshing:true,sampledAt:now-6000},now),/vertraagd/);
+  await s.repo.setSettings({spotify_playback_cache_v2:JSON.stringify({playback:null,queue:[],sampledAt:now,retryAt:0,stale:true,error:'Spotify vraagt even te wachten'})});
+  const failed=await load('@/lib/playback').getPlaybackSnapshot();
+  assert.equal(failed.refreshing,false); assert.equal(warning(failed,now),'Spotify vraagt even te wachten');
+  assert.equal(warning({stale:true,refreshing:true,sampledAt:now,error:'Connection failed'},now),'Connection failed');
+  assert.equal(warning({stale:false,sampledAt:now},now),'');
+  await s.repo.releaseLease('lock:playback-cache','other-worker'); s.close();
+});
+
 test('401 emits session-expired event; prior in-flight results cannot restore the old UI', async () => {
   const events=[]; let finish;
   const load=modules({}, {window:{dispatchEvent:e=>events.push(e.type)},Event,fetch:async p=> p==='/slow'?new Promise(resolve=>{finish=resolve;}):Response.json({error:'expired',code:'PARTY_ACCESS_REQUIRED'},{status:401})});

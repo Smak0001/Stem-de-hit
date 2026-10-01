@@ -16,7 +16,7 @@ export async function GET(request: Request) {
       item: playback?.item ? mapTrack(playback.item) : undefined,
       queue: snapshot.queue.filter(t => t.uri?.startsWith("spotify:track:")).slice(0, 20).map(mapTrack),
       device: playback?.device || null,
-      stale: snapshot.stale, sampledAt: snapshot.sampledAt, error: snapshot.error,
+      stale: snapshot.stale, refreshing: Boolean(snapshot.refreshing), sampledAt: snapshot.sampledAt, error: snapshot.error,
       hasManagedTail: Boolean(plan && position === plan.batchEnd - 1 && plan.uris.length > plan.batchEnd),
     }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) { return apiError(error, 503); }
