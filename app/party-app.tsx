@@ -7,15 +7,11 @@ import { Input } from "@/components/ui/input";
 import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
 import { Switch } from "@/components/ui/switch";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
-import { ACCESS_EXPIRED, ApiError, jsonFetch, resetClientSession } from "@/lib/client-api";
-import { autoDjDecision, type EndObservation } from "@/lib/auto-dj";
-import { PartyRanking } from "@/components/party-ranking";
-import { playbackWarning } from "@/lib/playback-status";
 
 type Track = { id: number; spotifyId: string; uri: string; name: string; artist: string; album: string; imageUrl: string | null; durationMs: number; votes: number; hasVoted: boolean; status: string };
 type SearchTrack = Omit<Track, "id" | "votes" | "hasVoted" | "status">;
 type Device = { id: string; name: string; type: string; is_active: boolean };
-type Playback = { active: boolean; stale?: boolean; refreshing?: boolean; sampledAt?: number; error?: string; hasManagedTail?: boolean; isPlaying?: boolean; progressMs?: number; item?: SearchTrack; queue?: SearchTrack[]; device?: { id: string; name: string; type: string } | null };
+type Playback = { active: boolean; isPlaying?: boolean; progressMs?: number; item?: SearchTrack; queue?: SearchTrack[]; device?: { id: string; name: string; type: string } | null };
 type ReactionEvent = { id: number; emoji: string; createdAt: number };
 type ReactionParticle = ReactionEvent & { x: number; drift: number; rotation: number };
 type ReactionCombo = { id: number; emoji: string | null; count: number };
@@ -38,6 +34,15 @@ const getVoterId = () => {
   let value = localStorage.getItem("stem-de-hit-voter");
   if (!value) { value = crypto.randomUUID(); localStorage.setItem("stem-de-hit-voter", value); }
   return value;
+};
+
+// API responses are validated at their route boundary; callers consume the route-specific shape.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const jsonFetch = async (url: string, options?: RequestInit): Promise<any> => {
+  const response = await fetch(url, options);
+  const data = await response.json().catch(() => ({})) as { error?: string } & Record<string, unknown>;
+  if (!response.ok) throw new Error(data.error || "Er ging iets mis. Probeer het opnieuw.");
+  return data;
 };
 
 function formatDuration(ms: number) {
@@ -206,7 +211,6 @@ export default function PartyApp() {
   const [searching, setSearching] = useState(false);
   const [configured, setConfigured] = useState(false);
   const [notice, setNotice] = useState("");
-  const [playerError, setPlayerError] = useState("");
   const [hostMode, setHostMode] = useState(false);
   const [appReady, setAppReady] = useState(false);
   const [joined, setJoined] = useState(false);
@@ -215,10 +219,6 @@ export default function PartyApp() {
   const [joining, setJoining] = useState(false);
   const [partyAccess, setPartyAccess] = useState<PartyCodeInfo | null>(null);
   const [showHost, setShowHost] = useState(false);
-  const [changingSpotify, setChangingSpotify] = useState(false);
-  const [newSpotifyParty, setNewSpotifyParty] = useState(false);
-  const [spotifyConnecting, setSpotifyConnecting] = useState(false);
-  const [spotifyConnectError, setSpotifyConnectError] = useState("");
   const [adminCode, setAdminCode] = useState("");
   const [clientId, setClientId] = useState("");
   const [devices, setDevices] = useState<Device[]>([]);
@@ -241,11 +241,8 @@ export default function PartyApp() {
   const triggeredFor = useRef("");
   const lastPlaybackId = useRef<string | null>(null);
   const autoDjBusy = useRef(false);
-  const spotifyCallbackStarted = useRef(false);
-  const previousPlayback = useRef<EndObservation | null>(null);
-  const autoDjRetryAt = useRef(0);
-  const commandForTrack = useRef<{ uri: string; id: string } | null>(null);
-  const preparedFor = useRef("");
+  const inactivePolls = useRef(0);
+  const expectedPlayback = useRef<{ spotifyId: string; itemId: number; until: number; normalizeOnStart: boolean; recoveryAttempts: number } | null>(null);
   const previousLeaderId = useRef<number | null>(null);
   const previousPartyPlaybackId = useRef<string | null>(null);
   const milestoneVotes = useRef(new Map<number, number>());
@@ -268,24 +265,10 @@ export default function PartyApp() {
   }, [adminCode, hostMode]);
 
   useEffect(() => {
-    const expired = () => {
-      if (hostMode) { setNotice("De beheercode is niet meer geldig. Open de hostinstellingen."); return; }
-      setJoined(false); setJoinCode(""); setJoinError("Deze sessie is afgelopen. Vul de nieuwe code van de tv in.");
-      setTracks([]); setResults([]); setVoterCount(0); setPlayback({ active: false });
-      pendingReactions.current = [];
-      if (reactionFlushTimer.current) clearTimeout(reactionFlushTimer.current);
-      reactionFlushTimer.current = null;
-    };
-    window.addEventListener(ACCESS_EXPIRED, expired);
-    return () => window.removeEventListener(ACCESS_EXPIRED, expired);
-  }, [hostMode]);
-
-  useEffect(() => {
     const isHost = new URLSearchParams(location.search).get("host") === "1";
     setHostMode(isHost);
     setShareUrl(`${location.origin}/`);
     setAdminCode(localStorage.getItem("stem-de-hit-admin") || "");
-    setClientId(localStorage.getItem("stem-de-hit-client") || "");
     setAutoDj(localStorage.getItem("stem-de-hit-auto-dj") !== "false");
     setPartyMode(localStorage.getItem("stem-de-hit-party-mode") === "true");
     if (isHost) { setJoined(true); setAppReady(true); return; }
@@ -294,32 +277,18 @@ export default function PartyApp() {
 
   useEffect(() => {
     if (!appReady || (!hostMode && !joined) || (hostMode && !adminCode)) return;
-    let stopped = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      try { await refresh(); } catch (error) { if (!stopped) setNotice(error instanceof Error ? error.message : "De verzoeklijst is tijdelijk niet bereikbaar."); }
-      if (!stopped) timer = setTimeout(poll, 1000);
-    };
-    void poll();
-    return () => { stopped = true; clearTimeout(timer); };
+    void refresh().catch((error) => setNotice(error.message));
+    const timer = setInterval(() => void refresh().catch(() => undefined), 1000);
+    return () => clearInterval(timer);
   }, [adminCode, appReady, hostMode, joined, refresh]);
 
   useEffect(() => {
     if (!appReady || (!hostMode && !joined) || (hostMode && !adminCode)) return;
     const adminQuery = hostMode && adminCode ? `?adminCode=${encodeURIComponent(adminCode)}` : "";
-    let stopped = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const loadPlayback = async () => {
-      let delay = 1000;
-      try { const data = await jsonFetch(`/api/playback${adminQuery}`, { cache: "no-store" }); if (!stopped) setPlayback(data); }
-      catch (error) {
-        if (!stopped && !(error instanceof ApiError && error.status === 401)) setPlayback(old => ({ ...old, stale: true, refreshing: false, error: error instanceof Error ? error.message : "De Spotify-status kon niet worden opgehaald. Auto-DJ wacht." }));
-        if (error instanceof ApiError) delay = Math.max(delay, error.retryAfter * 1000);
-      }
-      if (!stopped) timer = setTimeout(loadPlayback, delay);
-    };
-    void loadPlayback();
-    return () => { stopped = true; clearTimeout(timer); };
+    const loadPlayback = () => void jsonFetch(`/api/playback${adminQuery}`, { cache: "no-store" }).then(setPlayback).catch(() => setPlayback({ active: false }));
+    loadPlayback();
+    const timer = setInterval(loadPlayback, 1000);
+    return () => clearInterval(timer);
   }, [adminCode, appReady, configured, hostMode, joined]);
 
   useEffect(() => {
@@ -333,12 +302,7 @@ export default function PartyApp() {
   useEffect(() => {
     const params = new URLSearchParams(location.search);
     const code = params.get("code");
-    if (!hostMode || spotifyCallbackStarted.current || (!code && !params.has("error"))) return;
-    spotifyCallbackStarted.current = true;
-    setShowHost(true); setSpotifyConnecting(true);
-    const failed = (message: string) => { history.replaceState({}, "", "/?host=1"); setChangingSpotify(true); setSpotifyConnectError(message); setSpotifyConnecting(false); };
-    if (params.has("error")) { failed("Aanmelden bij Spotify is geannuleerd. Je bestaande koppeling is niet gewijzigd."); return; }
-    if (code) void completeSpotifyLogin(code, params.get("state")).catch((error) => failed(error.message));
+    if (code && hostMode) void completeSpotifyLogin(code, params.get("state")).catch((error) => setNotice(error.message));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostMode]);
 
@@ -487,23 +451,72 @@ export default function PartyApp() {
   }, [hostMode, autoDj]);
 
   useEffect(() => {
-    if (!hostMode || !autoDj || !autoDjLeader || !adminCode) return;
-    const remaining = playback.item ? playback.item.durationMs - Number(playback.progressMs || 0) : 0;
-    if (topTrack && playback.active && !playback.stale && playback.item && playback.isPlaying && remaining > 5000 && remaining <= 15_000 && preparedFor.current !== playback.item.uri && !autoDjBusy.current) {
-      preparedFor.current = playback.item.uri;
-      // Warm the full source without reserving a winner or modifying Spotify.
-      // This is optional preloading, not a playback command. Transient lock/status
-      // failures must not leave a permanent player error after polling recovers.
-      // The actual transition validates again and still reports any failure.
-      void jsonFetch("/api/host/play-next", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode, prepare: true }) }).catch(() => undefined);
+    if (!hostMode || !autoDj || !autoDjLeader || !adminCode || autoDjBusy.current) return;
+    // Keep ownership of the queued winner until Spotify confirms it started.
+    // Track/vote updates must not clear it or launch concurrent transitions.
+    const retryExpected = () => {
+      const expected = expectedPlayback.current;
+      if (!expected || Date.now() < expected.until) return;
+      if (expected.recoveryAttempts >= 2) {
+        if (expected.until !== Infinity) {
+          expected.until = Infinity;
+          setNotice("Spotify heeft het volgende nummer niet bevestigd. Controleer Spotify op de laptop en gebruik zo nodig Speel nu.");
+        }
+        return;
+      }
+      expected.recoveryAttempts += 1;
+      expected.until = Date.now() + 10_000;
+      void playNext(expected.itemId, true, true, true, true);
+    };
+    if (!playback.active || !playback.item) {
+      const inactiveCount = ++inactivePolls.current;
+      const expected = expectedPlayback.current;
+      if (expected && lastPlaybackId.current && inactiveCount >= 2 && !autoDjBusy.current) {
+        retryExpected();
+        return;
+      }
+      if (topTrack && lastPlaybackId.current && inactiveCount >= 2 && triggeredFor.current !== lastPlaybackId.current && !autoDjBusy.current) {
+        triggeredFor.current = lastPlaybackId.current;
+        void playNext(undefined, true);
+      }
+      return;
     }
-    const decision = autoDjDecision(playback, previousPlayback.current, Date.now(), Boolean(topTrack));
-    previousPlayback.current = decision.observation;
-    if (decision.afterTrack && triggeredFor.current !== decision.afterTrack && !autoDjBusy.current && Date.now() >= autoDjRetryAt.current) {
-      triggeredFor.current = decision.afterTrack;
-      if (commandForTrack.current?.uri !== decision.afterTrack) commandForTrack.current = { uri: decision.afterTrack, id: crypto.randomUUID() };
-      void playNext(undefined, true, decision.afterTrack);
+    inactivePolls.current = 0;
+    const currentId = playback.item.spotifyId;
+    if (expectedPlayback.current) {
+      if (currentId === expectedPlayback.current.spotifyId && playback.isPlaying) {
+        const expected = expectedPlayback.current;
+        expectedPlayback.current = null;
+        lastPlaybackId.current = currentId;
+        if (expected.normalizeOnStart && !autoDjBusy.current) void playNext(expected.itemId, true, true, true);
+        return;
+      }
+      const changedBeforeWinner = currentId !== expectedPlayback.current.spotifyId && lastPlaybackId.current !== null && lastPlaybackId.current !== currentId;
+      if (changedBeforeWinner && !autoDjBusy.current) {
+        expectedPlayback.current.until = Math.min(expectedPlayback.current.until, Date.now());
+        lastPlaybackId.current = currentId;
+        retryExpected();
+        return;
+      }
+      else {
+        const remaining = playback.item.durationMs - Number(playback.progressMs || 0);
+        // Never interpret a pause in the middle of a track as its end.
+        if (!playback.isPlaying && remaining <= 3000) retryExpected();
+        lastPlaybackId.current = currentId;
+        return;
+      }
     }
+    if (!topTrack) { lastPlaybackId.current = currentId; return; }
+    const changedNaturally = lastPlaybackId.current !== null && lastPlaybackId.current !== currentId;
+    const remaining = playback.item.durationMs - Number(playback.progressMs || 0);
+    const readyToQueue = Boolean(playback.isPlaying) && remaining > 0 && remaining <= 12_000;
+    const finishedWithoutNextTrack = !playback.isPlaying && remaining >= 0 && remaining <= 3000;
+    lastPlaybackId.current = currentId;
+    if ((readyToQueue || changedNaturally || finishedWithoutNextTrack) && triggeredFor.current !== currentId && !autoDjBusy.current) {
+      triggeredFor.current = currentId;
+      void playNext(undefined, true, !readyToQueue);
+    }
+  // Auto-DJ reacts to a real Spotify track transition or to playback ending without a next track.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playback, hostMode, autoDj, autoDjLeader, adminCode, topTrack?.id, tracks]);
 
@@ -553,39 +566,28 @@ export default function PartyApp() {
   }
 
   async function beginSpotifyLogin() {
-    if (spotifyConnecting) return;
-    if (!clientId.trim() || !adminCode.trim()) { setSpotifyConnectError("Vul je Spotify Client ID en beheercode in."); return; }
-    setSpotifyConnecting(true); setSpotifyConnectError("");
-    try {
-    await jsonFetch(`/api/host/party-code?adminCode=${encodeURIComponent(adminCode.trim())}`, { cache: "no-store" });
-    setAutoDj(false); localStorage.setItem("stem-de-hit-auto-dj", "false");
-    sessionStorage.setItem("spotify-new-party", String(newSpotifyParty));
-    sessionStorage.setItem("spotify-login-client", clientId.trim()); sessionStorage.setItem("spotify-login-admin", adminCode.trim());
+    if (!clientId.trim() || !adminCode.trim()) { setNotice("Vul je Spotify Client ID en beheercode in."); return; }
     localStorage.setItem("stem-de-hit-admin", adminCode.trim()); localStorage.setItem("stem-de-hit-client", clientId.trim());
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
     const verifier = Array.from(crypto.getRandomValues(new Uint8Array(64)), (n) => chars[n % chars.length]).join("");
-    sessionStorage.setItem("spotify-verifier", verifier);
+    localStorage.setItem("spotify-verifier", verifier);
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
     const challenge = btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-    const state = crypto.randomUUID(); sessionStorage.setItem("spotify-state", state);
+    const state = crypto.randomUUID(); localStorage.setItem("spotify-state", state);
     const auth = new URL("https://accounts.spotify.com/authorize");
-    auth.search = new URLSearchParams({ client_id: clientId.trim(), response_type: "code", redirect_uri: `${location.origin}/?host=1`, scope: "user-read-playback-state user-read-currently-playing user-modify-playback-state playlist-read-private playlist-read-collaborative", code_challenge_method: "S256", code_challenge: challenge, state, show_dialog: "true" }).toString();
+    auth.search = new URLSearchParams({ client_id: clientId.trim(), response_type: "code", redirect_uri: `${location.origin}/?host=1`, scope: "user-read-playback-state user-read-currently-playing user-modify-playback-state", code_challenge_method: "S256", code_challenge: challenge, state }).toString();
     location.href = auth.toString();
-    } catch (error) { setSpotifyConnectError(error instanceof Error ? error.message : "Koppelen is niet gelukt."); setSpotifyConnecting(false); }
   }
 
   async function completeSpotifyLogin(code: string, returnedState: string | null) {
-    const verifier = sessionStorage.getItem("spotify-verifier"); const savedClient = sessionStorage.getItem("spotify-login-client"); const savedAdmin = sessionStorage.getItem("spotify-login-admin");
+    const verifier = localStorage.getItem("spotify-verifier"); const savedClient = localStorage.getItem("stem-de-hit-client"); const savedAdmin = localStorage.getItem("stem-de-hit-admin");
     if (!verifier || !savedClient || !savedAdmin) throw new Error("De Spotify-aanmelding is verlopen. Start opnieuw.");
-    if (!returnedState || returnedState !== sessionStorage.getItem("spotify-state")) throw new Error("De Spotify-aanmelding kon niet veilig worden bevestigd. Start opnieuw.");
+    if (!returnedState || returnedState !== localStorage.getItem("spotify-state")) throw new Error("De Spotify-aanmelding kon niet veilig worden bevestigd. Start opnieuw.");
     const tokenResponse = await fetch("https://accounts.spotify.com/api/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: savedClient, grant_type: "authorization_code", code, redirect_uri: `${location.origin}/?host=1`, code_verifier: verifier }) });
     const tokens = await tokenResponse.json() as Record<string, string | number>; if (!tokenResponse.ok) throw new Error("Spotify kon niet worden gekoppeld. Controleer de Redirect URI.");
-    const result = await jsonFetch("/api/host/setup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode: savedAdmin, clientId: savedClient, ...tokens, newParty: sessionStorage.getItem("spotify-new-party") === "true" }) });
-    sessionStorage.removeItem("spotify-verifier"); sessionStorage.removeItem("spotify-state"); sessionStorage.removeItem("spotify-new-party");
-    sessionStorage.removeItem("spotify-login-client"); sessionStorage.removeItem("spotify-login-admin");
-    history.replaceState({}, "", "/?host=1"); setConfigured(true); setAdminCode(savedAdmin); setChangingSpotify(false); setSpotifyConnecting(false); setShowHost(true); setPlayback({ active: false }); setDevices([]); setSelectedDevice("");
-    await loadDevices(savedAdmin).catch(() => undefined);
-    setNotice(`Spotify is gekoppeld aan ${result.accountName}. Kies je apparaat en zet Auto-DJ aan wanneer je klaar bent.`);
+    await jsonFetch("/api/host/setup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode: savedAdmin, clientId: savedClient, ...tokens }) });
+    localStorage.removeItem("spotify-verifier"); localStorage.removeItem("spotify-state");
+    history.replaceState({}, "", "/?host=1"); setNotice("Spotify is gekoppeld."); setConfigured(true); setAdminCode(savedAdmin); await loadDevices(savedAdmin);
   }
 
   async function loadDevices(code = adminCode) {
@@ -594,32 +596,27 @@ export default function PartyApp() {
     setDevices(data.devices); setSelectedDevice(data.devices.find((device: Device) => device.is_active)?.id || data.devices[0]?.id || ""); setNotice("");
   }
 
-  async function playNext(itemId?: number, automatic = false, afterTrack?: string) {
+  async function playNext(itemId?: number, automatic = false, immediate = true, recover = false, ensureStarted = false) {
     if (autoDjBusy.current) return;
     setBusyId(itemId ?? -2);
     autoDjBusy.current = true;
+    const recoveryAttempts = ensureStarted ? expectedPlayback.current?.recoveryAttempts || 0 : 0;
     try {
-      const data = await jsonFetch("/api/host/play-next", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode, itemId, deviceId: selectedDevice || undefined, automatic, afterTrack, commandId: automatic ? commandForTrack.current?.id : crypto.randomUUID() }) });
-      if (data.waiting) { triggeredFor.current = ""; return; }
-      setPlayerError("");
-      if (data.played) { previousPlayback.current = null; setNotice(`${data.name} speelt nu op Spotify.`); }
+      const data = await jsonFetch("/api/host/play-next", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode, itemId, deviceId: selectedDevice || undefined, immediate, recover, ensureStarted }) });
+      const remaining = Math.max(0, (playback.item?.durationMs || 0) - Number(playback.progressMs || 0));
+      expectedPlayback.current = { spotifyId: data.spotifyId, itemId: data.itemId, until: Date.now() + (immediate ? 10_000 : remaining + 2000), normalizeOnStart: Boolean(data.normalizeOnStart), recoveryAttempts };
+      setNotice(automatic && !immediate ? `${data.name} staat klaar als volgende.` : automatic ? `${data.name} is als winnaar gestart.` : `${data.name} speelt nu op Spotify.`);
       await refresh();
       const latest = await jsonFetch(`/api/playback?adminCode=${encodeURIComponent(adminCode)}`, { cache: "no-store" }).catch(() => null);
-      if (latest?.item?.spotifyId) lastPlaybackId.current = latest.item.spotifyId;
       if (latest) setPlayback(latest);
     }
-    catch (error) { if (automatic) { triggeredFor.current = ""; autoDjRetryAt.current = Date.now() + Math.max(5000, error instanceof ApiError ? error.retryAfter * 1000 : 0); } const message = error instanceof Error ? error.message : "Afspelen op Spotify lukte niet."; setNotice(message); setPlayerError(message); }
+    catch (error) { if (automatic) triggeredFor.current = ""; setNotice(error instanceof Error ? error.message : "Afspelen op Spotify lukte niet."); }
     finally { setBusyId(null); autoDjBusy.current = false; }
   }
 
   async function startNewParty() {
     setBusyId(-3); setNotice("");
-    try {
-      await jsonFetch("/api/host/reset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode }) });
-      resetClientSession(); setTracks([]); setResults([]); setQuery(""); setPlayerError("");
-      triggeredFor.current = ""; previousPlayback.current = null; commandForTrack.current = null; lastPlaybackId.current = null; autoDjRetryAt.current = 0; preparedFor.current = "";
-      setNotice("Nieuwe sessie gestart. De oude verzoeken en stemmen zijn gewist. Gasten voeren de nieuwe tv-code in."); await refresh();
-    }
+    try { await jsonFetch("/api/host/reset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adminCode }) }); setTracks([]); setResults([]); setQuery(""); triggeredFor.current = ""; setNotice("Nieuwe sessie gestart. De oude verzoeken en stemmen zijn gewist."); await refresh(); }
     catch (error) { setNotice(error instanceof Error ? error.message : "Nieuwe sessie starten lukte niet."); }
     finally { setBusyId(null); }
   }
@@ -630,7 +627,7 @@ export default function PartyApp() {
     setJoining(true); setJoinError("");
     try {
       await jsonFetch("/api/join", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: joinCode }) });
-      resetClientSession(); setJoined(true); setJoinCode("");
+      setJoined(true); setJoinCode("");
     } catch (error) {
       setJoinError(error instanceof Error ? error.message : "De code klopt niet.");
     } finally {
@@ -665,7 +662,6 @@ export default function PartyApp() {
 
   return (
     <main className={`${hostMode ? "h-[100dvh] overflow-hidden" : "min-h-screen w-full max-w-full overflow-x-hidden"} bg-[radial-gradient(circle_at_75%_5%,rgba(81,255,168,.13),transparent_28%),linear-gradient(145deg,#07110d_0%,#0d1813_52%,#050907_100%)] text-white`}>
-      {(playbackWarning(playback) || playerError) && <div role="status" className="fixed bottom-3 left-3 right-3 z-[100] rounded-xl border border-amber-300/30 bg-zinc-950/95 px-4 py-3 text-center text-sm text-amber-200">{playerError || playbackWarning(playback)}</div>}
       <header className={`mx-auto flex min-w-0 max-w-7xl items-center justify-between px-3 min-[360px]:px-4 sm:px-8 ${hostMode ? "h-16" : "py-4 sm:py-5"}`}>
         <a href="/" className="flex items-center gap-3 font-black tracking-tight"><span className="grid h-10 w-10 place-items-center rounded-2xl bg-[#64f5a4] text-[#07110d] shadow-[0_0_28px_rgba(100,245,164,.28)]"><Music2 size={21}/></span><span className="text-xl">Stem de Hit</span></a>
         <div className="flex items-center gap-2">{hostMode && <span className={`hidden rounded-full px-3 py-1 text-xs font-black sm:block ${autoDj ? "bg-[#64f5a4]/15 text-[#64f5a4]" : "bg-white/10 text-zinc-500"}`}>Auto-DJ {autoDj ? "aan" : "uit"}</span>}<Button variant="ghost" className="rounded-full text-zinc-300 hover:bg-white/10 hover:text-white" onClick={() => setShowHost(!showHost)}><Settings2 size={17}/><span className="hidden sm:inline">Hostinstellingen</span></Button></div>
@@ -721,7 +717,7 @@ export default function PartyApp() {
               {playback.active && playback.item ? <div className="grid min-h-0 w-full items-center gap-7 lg:grid-cols-[minmax(260px,.9fr)_minmax(0,1.1fr)]"><div className="grid min-h-0 place-items-center">{playback.item.imageUrl ? <img src={playback.item.imageUrl} alt="Albumhoes" className="party-album-pulse aspect-square max-h-[62vh] w-full max-w-[min(58vh,34rem)] rounded-[28px] object-contain shadow-[0_32px_90px_rgba(0,0,0,.65)]"/> : <span className="party-album-pulse grid aspect-square w-full max-w-[min(58vh,34rem)] place-items-center rounded-[28px] bg-white/10"><Music2 size={70}/></span>}</div><div className="min-w-0"><span className="mb-5 inline-flex items-center gap-2 rounded-full bg-[#64f5a4] px-4 py-2 text-xs font-black uppercase tracking-[.16em] text-[#07110d]"><Volume2 size={15}/>Nu speelt</span><h1 className="line-clamp-2 text-5xl font-black leading-[.92] tracking-[-.055em] xl:text-7xl">{playback.item.name}</h1><p className="mt-4 truncate text-2xl font-semibold text-zinc-400 xl:text-3xl">{playback.item.artist}</p><div className="mt-8"><div className="mb-2 flex justify-between text-sm font-bold text-zinc-500"><span>{formatDuration(playback.progressMs || 0)}</span><span>{formatDuration(playback.item.durationMs)}</span></div><div className="h-2.5 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-fuchsia-400 to-[#64f5a4] transition-all duration-700" style={{ width: `${Math.min(100, Math.max(0, ((playback.progressMs || 0) / Math.max(1, playback.item.durationMs)) * 100))}%` }}/></div></div><div className="mt-7 flex h-12 items-end gap-2" aria-hidden="true">{[42,72,54,92,64,38,80,58,96,48,70,40].map((height, index) => <span key={index} className="w-2 animate-pulse rounded-full bg-gradient-to-t from-fuchsia-500 to-[#64f5a4]" style={{ height: `${height}%`, animationDelay: `${index * 90}ms` }}/>)}</div></div></div> : <div className="m-auto text-center"><span className="mx-auto grid h-24 w-24 place-items-center rounded-[30px] bg-white/[.06] text-zinc-600"><Headphones size={48}/></span><h1 className="mt-6 text-4xl font-black">Start Spotify op de laptop</h1><p className="mt-2 text-lg text-zinc-500">Party Mode springt vanzelf aan zodra de muziek speelt.</p></div>}
             </div>
 
-            <aside className="flex min-h-0 flex-col gap-4"><PartyRanking candidates={candidateTracks} queue={spotifyQueueTracks} flashId={voteFlashId}/>
+            <aside className="flex min-h-0 flex-col gap-4"><div className="min-h-0 flex-1 overflow-hidden rounded-[28px] border border-white/10 bg-white/[.045] p-5"><div className="mb-4 flex items-center justify-between"><div><p className="text-xs font-black uppercase tracking-[.18em] text-[#64f5a4]">Live ranglijst</p><h2 className="mt-1 text-2xl font-black">Hierna</h2></div><span className="rounded-full bg-white/[.06] px-3 py-1.5 text-sm font-bold text-zinc-400">Top 5</span></div><div className="grid gap-3">{candidateTracks.slice(0, 5).map((track, index) => <div key={track.id} className={`flex items-center gap-3 rounded-2xl border p-3 ${index === 0 ? "border-[#64f5a4]/30 bg-[#64f5a4]/10" : "border-white/[.06] bg-white/[.035]"} ${voteFlashId === track.id ? "party-vote-flash" : ""}`}><span className={`grid h-8 w-8 shrink-0 place-items-center rounded-xl text-sm font-black ${index === 0 ? "bg-[#64f5a4] text-[#07110d]" : "bg-white/10 text-zinc-400"}`}>{index + 1}</span>{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-12 w-12 shrink-0 rounded-xl object-cover"/> : <span className="grid h-12 w-12 shrink-0 place-items-center rounded-xl bg-white/10"><Music2 size={18}/></span>}<div className="min-w-0 flex-1"><h3 className="truncate font-black">{track.name}</h3><p className="truncate text-sm text-zinc-500">{track.artist}</p></div><span className="flex items-center gap-1 rounded-xl bg-black/20 px-2.5 py-2 text-sm font-black text-[#64f5a4]"><ChevronUp size={15}/>{track.votes}</span></div>)}{candidateTracks.length === 0 && playback.queue?.slice(0, 5).map((track, index) => <div key={`${track.spotifyId}-${index}`} className="flex items-center gap-3 rounded-2xl border border-white/[.06] bg-white/[.035] p-3"><span className="grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-white/10 text-sm font-black text-zinc-500">{index + 1}</span>{track.imageUrl ? <img src={track.imageUrl} alt="" className="h-12 w-12 shrink-0 rounded-xl object-cover"/> : <span className="grid h-12 w-12 shrink-0 place-items-center rounded-xl bg-white/10"><Music2 size={18}/></span>}<div className="min-w-0"><h3 className="truncate font-bold">{track.name}</h3><p className="truncate text-sm text-zinc-500">{track.artist}</p></div></div>)}{candidateTracks.length === 0 && !playback.queue?.length && <div className="grid min-h-40 place-items-center rounded-2xl border border-dashed border-white/10 text-center text-zinc-600"><div><Music2 className="mx-auto mb-2"/><p>Nog geen nummers klaar</p></div></div>}</div></div>
               <button onClick={() => setPartyQrOpen(true)} className="flex shrink-0 items-center gap-4 rounded-[24px] border border-[#64f5a4]/20 bg-[#64f5a4]/10 p-4 text-left transition hover:bg-[#64f5a4]/15"><div className="grid h-20 w-20 shrink-0 place-items-center overflow-hidden rounded-xl bg-white p-1.5">{shareUrl ? <img src={`https://quickchart.io/qr?text=${encodeURIComponent(shareUrl)}&size=160&margin=1`} alt="QR-code" className="h-full w-full"/> : <QrCode className="text-[#07110d]"/>}</div><div className="min-w-0 flex-1"><p className="font-black text-[#baffd4]">Nog iemand laten stemmen?</p>{partyAccess ? <p className="mt-1 font-mono text-lg font-black tracking-[.15em] text-white">{partyAccess.code}</p> : <p className="mt-1 text-sm text-[#79ba96]">Klik om de QR-code groot te tonen</p>}</div><QrCode className="shrink-0 text-[#64f5a4]"/></button></aside>
           </div>
         </div>
@@ -735,19 +731,14 @@ export default function PartyApp() {
           <div className="mb-6 flex items-start justify-between"><div><p className="mb-2 flex items-center gap-2 text-sm font-bold text-[#64f5a4]"><LockKeyhole size={16}/>Alleen voor de host</p><h2 className="text-3xl font-black tracking-tight">Bedien de avond</h2></div><button onClick={() => setShowHost(false)} aria-label="Sluiten"><X/></button></div>
           <div className="mb-5 flex items-center justify-between gap-4 rounded-2xl border border-white/10 bg-white/[.04] p-4"><div><label htmlFor="auto-dj" className="font-bold">Auto-DJ</label><p className="mt-1 text-sm text-zinc-500">Speel automatisch het nummer met de meeste stemmen.</p></div><Switch id="auto-dj" checked={autoDj} onCheckedChange={(next) => { setAutoDj(next); localStorage.setItem("stem-de-hit-auto-dj", String(next)); }}/></div>
           {hostMode && <div className="mb-5 flex items-center justify-between gap-4 rounded-2xl border border-fuchsia-400/20 bg-fuchsia-400/[.07] p-4"><div><label htmlFor="party-mode" className="font-bold text-fuchsia-100">Party Mode</label><p className="mt-1 text-sm text-zinc-500">Grote albumhoes, top drie, animaties en compacte QR-code.</p></div><Switch id="party-mode" checked={partyMode} onCheckedChange={(next) => { setPartyMode(next); setPartyQrOpen(false); localStorage.setItem("stem-de-hit-party-mode", String(next)); }}/></div>}
-          {!configured || changingSpotify ? <div className="space-y-4">
-            {changingSpotify && <div className="rounded-xl border border-amber-300/30 bg-amber-300/10 p-4 text-sm text-amber-100"><strong>Ander Spotify-account koppelen</strong><p className="mt-2">De bestaande koppeling blijft behouden tot aanmelden lukt. Sluit andere hosttabbladen voordat je wisselt. Auto-DJ wordt op dit scherm uitgezet.</p><p className="mt-2">Kies bij Spotify ‘Niet jij?’ of meld je daar eerst af als het verkeerde account verschijnt.</p></div>}
+          {!configured ? <div className="space-y-4">
             <p className="text-sm leading-6 text-zinc-400">Maak in het Spotify Developer Dashboard een app aan en voeg deze exacte Redirect URI toe:</p>
             <code className="block overflow-x-auto rounded-xl bg-black/30 p-3 text-xs text-[#9cfbc4]">{shareUrl}?host=1</code>
             <label className="block text-sm font-semibold">Spotify Client ID<Input value={clientId} onChange={(e) => setClientId(e.target.value)} className="mt-2 h-12 border-white/10 bg-white/[.06]" placeholder="Bijvoorbeeld 1a2b3c…"/></label>
             <label className="block text-sm font-semibold">Beheercode<Input type="password" value={adminCode} onChange={(e) => setAdminCode(e.target.value)} className="mt-2 h-12 border-white/10 bg-white/[.06]" placeholder="De code die je van ons krijgt"/></label>
-            <div className="flex items-start justify-between gap-4 rounded-xl border border-white/10 p-4"><div><label htmlFor="new-spotify-party" className="font-semibold">Begin met een lege muzieksessie</label><p className="mt-1 text-sm text-zinc-400">Na succesvol koppelen worden verzoeken, stemmen en reacties gewist. Gasten moeten opnieuw de feestcode invullen.</p></div><Switch id="new-spotify-party" checked={newSpotifyParty} onCheckedChange={setNewSpotifyParty}/></div>
-            {spotifyConnectError && <p role="alert" className="text-sm text-red-300">{spotifyConnectError}</p>}
-            <Button onClick={() => void beginSpotifyLogin()} disabled={spotifyConnecting} className="h-12 w-full rounded-xl bg-[#64f5a4] font-black text-[#07110d] hover:bg-[#8affba]">{spotifyConnecting ? "Spotify openen…" : "Koppel met Spotify"}</Button>
-            {changingSpotify && <Button variant="outline" disabled={spotifyConnecting} onClick={() => { setChangingSpotify(false); setSpotifyConnectError(""); }} className="w-full border-white/10 bg-white/[.04] text-white">Annuleren</Button>}
+            <Button onClick={beginSpotifyLogin} className="h-12 w-full rounded-xl bg-[#64f5a4] font-black text-[#07110d] hover:bg-[#8affba]">Koppel met Spotify</Button>
           </div> : <div className="space-y-5">
             <div className="rounded-2xl border border-[#64f5a4]/20 bg-[#64f5a4]/10 p-4 text-sm text-[#bcffd7]"><strong className="flex items-center gap-2"><Check size={17}/>Spotify is gekoppeld</strong><p className="mt-1 text-[#8bd7aa]">Laat Spotify spelen op de laptop en kies dat apparaat hieronder.</p></div>
-            <Button variant="outline" onClick={() => { setChangingSpotify(true); setNewSpotifyParty(false); setSpotifyConnectError(""); }} className="w-full border-[#64f5a4]/30 bg-[#64f5a4]/5 text-[#bcffd7] hover:bg-[#64f5a4]/15">Ander Spotify-account koppelen</Button>
             <label className="block text-sm font-semibold">Beheercode<div className="mt-2 flex gap-2"><Input type="password" value={adminCode} onChange={(e) => setAdminCode(e.target.value)} className="h-11 border-white/10 bg-white/[.06]"/><Button onClick={() => loadDevices()} variant="outline" className="h-11 border-white/10 bg-white/[.06] text-white hover:bg-white/10">Ververs</Button></div></label>
             {devices.length > 0 && <div><p className="mb-2 text-sm font-semibold">Spotify-apparaat</p><div className="grid gap-2">{devices.map((device) => <button key={device.id} onClick={() => setSelectedDevice(device.id)} className={`flex items-center justify-between rounded-xl border p-3 text-left ${selectedDevice === device.id ? "border-[#64f5a4] bg-[#64f5a4]/10" : "border-white/10 bg-white/[.04]"}`}><span><strong className="block">{device.name}</strong><span className="text-xs text-zinc-500">{device.type}</span></span>{device.is_active && <span className="text-xs font-bold text-[#64f5a4]">Actief</span>}</button>)}</div></div>}
             <AlertDialog><AlertDialogTrigger asChild><Button variant="outline" className="w-full rounded-xl border-red-400/25 bg-red-400/5 text-red-200 hover:bg-red-400/15 hover:text-red-100"><RotateCcw size={16}/>Nieuwe sessie</Button></AlertDialogTrigger><AlertDialogContent className="border-white/10 bg-[#101914] text-white"><AlertDialogHeader><AlertDialogTitle>Nieuwe muzieksessie starten?</AlertDialogTitle><AlertDialogDescription className="text-zinc-400">Alle oude verzoeken en stemmen worden definitief gewist. De Spotify-koppeling blijft bewaard.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel className="border-white/10 bg-white/[.04] text-white hover:bg-white/10 hover:text-white">Annuleren</AlertDialogCancel><AlertDialogAction onClick={() => void startNewParty()} disabled={busyId === -3} className="bg-red-500 font-bold text-white hover:bg-red-400">Wis lijst en start opnieuw</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>

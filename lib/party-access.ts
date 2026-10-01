@@ -103,5 +103,5 @@ export async function rotatePartyAccess() {
 }
 
 export function partyAccessDenied() {
-  return Response.json({ code: "PARTY_ACCESS_REQUIRED", error: "Voer eerst de toegangscode van het scherm in." }, { status: 401, headers: { "Cache-Control": "no-store" } });
+  return Response.json({ error: "Voer eerst de toegangscode van het scherm in." }, { status: 401, headers: { "Cache-Control": "no-store" } });
 }

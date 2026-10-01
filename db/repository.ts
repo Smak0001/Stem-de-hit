@@ -5,20 +5,6 @@ function database() { if (!env.DB) throw new Error("De verzoeklijst is tijdelijk
 export async function getSetting(key: string) { const row = await database().prepare("SELECT value FROM settings WHERE key = ?").bind(key).first<{ value: string }>(); return row?.value ?? null; }
 export async function setSettings(values: Record<string, string>) { const db = database(); const now = Date.now(); await db.batch(Object.entries(values).map(([key, value]) => db.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").bind(key, value, now))); }
 export async function getOrCreateSetting(key: string, initialValue: string) { const db = database(); await db.prepare("INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)").bind(key, initialValue, Date.now()).run(); return (await db.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first<{ value: string }>())?.value ?? initialValue; }
-// D1 leases coordinate Workers as well as tabs; module-level locks do not.
-export async function acquireLease(key: string, owner: string, ttlMs: number) {
-  const now = Date.now();
-  const result = await database().prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at WHERE settings.updated_at <= ?")
-    .bind(key, owner, now + ttlMs, now).run();
-  return result.meta.changes === 1;
-}
-export async function releaseLease(key: string, owner: string) {
-  await database().prepare("DELETE FROM settings WHERE key = ? AND value = ?").bind(key, owner).run();
-}
-export async function extendDeadline(key: string, until: number) {
-  await database().prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at WHERE CAST(settings.value AS INTEGER) < CAST(excluded.value AS INTEGER)")
-    .bind(key, String(until), Date.now()).run();
-}
 export async function listTracks(voterId: string) { const result = await database().prepare(`SELECT s.id, s.spotify_id AS spotifyId, s.uri, s.name, s.artist, s.album, s.image_url AS imageUrl, s.duration_ms AS durationMs, s.status, COUNT(v.id) AS votes, MAX(CASE WHEN v.voter_id = ? THEN 1 ELSE 0 END) AS hasVoted FROM suggestions s LEFT JOIN votes v ON v.suggestion_id = s.id GROUP BY s.id ORDER BY CASE WHEN s.status = 'candidate' THEN 0 ELSE 1 END, votes DESC, s.created_at ASC`).bind(voterId).all(); return result.results.map((row) => ({ ...row, votes: Number(row.votes), hasVoted: Boolean(row.hasVoted) })); }
 export async function getVoterCount() { const row = await database().prepare("SELECT COUNT(DISTINCT voter_id) AS count FROM votes").first<{ count: number }>(); return Number(row?.count || 0); }
 export async function addSuggestion(track: TrackInput, voterId: string) { const db = database(); const now = Date.now(); await db.prepare("INSERT INTO suggestions (spotify_id, uri, name, artist, album, image_url, duration_ms, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'candidate', ?) ON CONFLICT(spotify_id, status) DO NOTHING").bind(track.spotifyId, track.uri, track.name, track.artist, track.album, track.imageUrl, track.durationMs, now).run(); const item = await db.prepare("SELECT id FROM suggestions WHERE spotify_id = ? AND status = 'candidate'").bind(track.spotifyId).first<{ id: number }>(); if (!item) throw new Error("Nummer kon niet worden toegevoegd."); await db.prepare("INSERT INTO votes (suggestion_id, voter_id, created_at) VALUES (?, ?, ?) ON CONFLICT(suggestion_id, voter_id) DO NOTHING").bind(item.id, voterId, now).run(); return item.id; }
