@@ -485,10 +485,10 @@ export default function PartyApp() {
     const currentId = playback.item.spotifyId;
     if (expectedPlayback.current) {
       if (currentId === expectedPlayback.current.spotifyId && playback.isPlaying) {
-        const expected = expectedPlayback.current;
         expectedPlayback.current = null;
         lastPlaybackId.current = currentId;
-        if (expected.normalizeOnStart && !autoDjBusy.current) void playNext(expected.itemId, true, true, true);
+        // Spotify already started the winner. Never rebuild its sequence here:
+        // that restarts playback at zero, including during a crossfade.
         return;
       }
       const changedBeforeWinner = currentId !== expectedPlayback.current.spotifyId && lastPlaybackId.current !== null && lastPlaybackId.current !== currentId;

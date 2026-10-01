@@ -36,18 +36,18 @@ export async function POST(request: Request) {
     assertAdmin(adminCode);
     const track = itemId ? await getTrack(Number(itemId)) : await getTopCandidate();
     if (!track || (track.status !== "candidate" && !(recover && track.status === "queued"))) throw new Error("Er staat geen nummer klaar om af te spelen.");
-    if (recover && ensureStarted) {
+    if (recover) {
       // A delayed host poll may still show the old track after Spotify moved on.
       // Recheck before recovery so the winner is not restarted at position zero.
       const current = await spotifyFetch("/me/player?additional_types=track") as { is_playing?: boolean; item?: { uri?: string } } | null;
-      if (current?.is_playing && current.item?.uri === track.uri) {
-        return Response.json({ played: true, queued: true, itemId: track.id, name: track.name, spotifyId: track.uri.split(":").pop() || "", normalizeOnStart: false, strategy: "already-playing" });
+      if (current?.item?.uri === track.uri) {
+        return Response.json({ played: Boolean(current.is_playing), queued: true, itemId: track.id, name: track.name, spotifyId: track.uri.split(":").pop() || "", normalizeOnStart: false, strategy: "already-playing" });
       }
     }
     const snapshot = await readQueueSnapshot();
     const queuedOccurrences = snapshot.futureUris.filter((uri) => uri === track.uri).length;
     const isAlreadyNext = snapshot.futureUris[0] === track.uri;
-    let normalizeOnStart = false;
+    const normalizeOnStart = false;
     let strategy = "queue";
 
     if (recover || (immediate && queuedOccurrences > 0)) {
@@ -62,9 +62,7 @@ export async function POST(request: Request) {
       if (deviceId) nextParams.set("device_id", String(deviceId));
       await spotifyFetch(`/me/player/next${nextParams.size ? `?${nextParams}` : ""}`, { method: "POST" });
     }
-    if (!immediate && !recover) {
-      normalizeOnStart = queuedOccurrences > (isAlreadyNext ? 1 : 0);
-    }
+    // Do not ask even older host tabs to restart the winner after it starts.
     await markQueued(track.id);
     return Response.json({ played: immediate, queued: true, itemId: track.id, name: track.name, spotifyId: track.uri.split(":").pop() || "", normalizeOnStart, strategy });
   } catch (error) {

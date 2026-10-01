@@ -77,15 +77,16 @@ test('temporarily unavailable playback waits for deadline and remains bounded', 
   assert.equal(s.state.expectedPlayback.current.spotifyId, 'winner');
 });
 
-test('in-flight command cannot lose pending winner or normalize twice', () => {
+test('in-flight command cannot lose pending winner; confirmation never restarts it', () => {
   const s = scenario(); s.state.autoDjBusy.current = true;
   s.state.playback.item.spotifyId = 'winner'; s.state.playback.isPlaying = true;
   s.state.expectedPlayback.current.normalizeOnStart = true;
   s.run(); assert.ok(s.state.expectedPlayback.current); assert.equal(s.calls.length, 0);
-  s.state.autoDjBusy.current = false; s.run(); s.run(); assert.equal(s.calls.length, 1);
+  s.state.autoDjBusy.current = false; s.run(); s.run(); assert.equal(s.calls.length, 0);
+  assert.equal(s.state.expectedPlayback.current, null);
 });
 
-function routeHarness(current) {
+function routeHarness(current, overrides = {}) {
   const requests = [];
   const track = { id: 7, status: 'queued', uri: 'spotify:track:winner', name: 'Winner' };
   const compiled = ts.transpileModule(readFileSync('app/api/host/play-next/route.ts', 'utf8'), {
@@ -106,7 +107,7 @@ function routeHarness(current) {
   };
   new Function('require', 'exports', compiled)(name => mocks[name], exports);
   return { requests, run: () => exports.POST(new Request('http://localhost/api/host/play-next', {
-    method: 'POST', body: JSON.stringify({ adminCode: 'test-only', itemId: 7, recover: true, ensureStarted: true }),
+    method: 'POST', body: JSON.stringify({ adminCode: 'test-only', itemId: 7, recover: true, ensureStarted: true, ...overrides }),
   })) };
 }
 
@@ -128,4 +129,24 @@ test('failed confirmation does not issue a blind playback command', async () => 
   const s = routeHarness(new Error('temporary Spotify error'));
   assert.equal((await s.run()).status, 503);
   assert.equal(s.requests.length, 1);
+});
+
+test('old host tabs cannot normalize/restart the current winner either', async () => {
+  for (const is_playing of [true, false]) {
+    const s = routeHarness({ is_playing, item: { uri: 'spotify:track:winner' } }, { ensureStarted: false });
+    const data = await (await s.run()).json();
+    assert.equal(data.played, is_playing);
+    assert.equal(data.normalizeOnStart, false);
+    assert.equal(s.requests.length, 1);
+  }
+});
+
+test('crossfade confirmation with duplicate flag sends no new playback command', () => {
+  const s = scenario();
+  s.state.expectedPlayback.current.normalizeOnStart = true;
+  s.state.playback = { active: true, isPlaying: true, progressMs: 0, item: { spotifyId: 'winner', durationMs: 200_000 } };
+  s.run();
+  for (let id = 8; id < 18; id++) { s.state.topTrack = { id }; s.run(); }
+  assert.equal(s.calls.length, 0);
+  assert.equal(s.state.expectedPlayback.current, null);
 });
